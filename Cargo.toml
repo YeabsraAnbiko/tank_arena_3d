@@ -1,0 +1,33 @@
+[package]
+name = "tank_arena_3d"
+version = "0.1.0"
+edition = "2021"
+description = "3D LAN tank arena: tap to fire, hold to drive, bouncing bullets"
+
+[dependencies]
+macroquad = { version = "0.4", features = ["audio"], default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Dev builds of the game are slow; optimise dependencies even in debug.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Used by `cargo quad-apk` (Android). Audio and the font are embedded in the
+# binary with include_bytes!, so no Android asset folder is needed.
+[package.metadata.android]
+package_name = "org.tankarena.tank3d"
+label = "Tank Arena 3D"
+version_name = "0.1.0"
+version_code = 1
+min_sdk_version = 21
+target_sdk_version = 33
+fullscreen = true
+build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
+
+[package.metadata.android.activity_attributes]
+"android:screenOrientation" = "sensorLandscape"
