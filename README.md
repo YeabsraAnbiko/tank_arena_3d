@@ -8,7 +8,7 @@ Runs on Linux, Windows and Android with the same code.
 Chase view (default) - "drive" scheme:
 | Action | Keyboard / mouse | Touch |
 |---|---|---|
-| Drive | W/S forward/back, A/D turn (or arrows) | left stick |
+| Drive | W/A/S/D or arrows: tank goes that way on screen (W away, S toward you, A left, D right) | left stick |
 | Aim turret + camera | mouse, or Q/E | drag right side |
 | Fire | left click / Space (auto-fire, 5-round magazine) | FIRE button |
 | Boost | Shift (stamina bar) | BOOST button |
@@ -22,7 +22,7 @@ Settings has an aim-sensitivity slider.
 and drive · release = spin again. Desktop extras: Space = tap/hold, C = switch
 camera, Esc = back.
 
-**Features:** 3D arena with chase or map camera · bouncing bullets (2 bounces) ·
+**Features:** textured meadow that fills the whole screen, brick walls, sky, trees and hills ·  3D arena with chase or map camera · bouncing bullets (2 bounces) ·
 5-round magazine with reload · friendly-fire immunity between teammates ·
 random crates (repair, reload, nitro, rapid fire, shield) · practice vs 3 bots ·
 LAN multiplayer 1v1 / 2v2 / 4v4 with auto-discovery on WiFi or a phone hotspot,
@@ -102,3 +102,8 @@ Settings are saved to `tank_arena_3d_settings.txt` in the working directory when
 writable (on Android the defaults are used if the app folder is read-only).
 
 Font: `assets/fonts/font.ttf` is Press Start 2P (SIL Open Font License 1.1, license text embedded in the font file).
+
+## Arena, tanks and the garage
+- The arena is now 1440x800 (was 960x640) with a brick wall, ponds (tanks cannot enter, bullets fly over), mud (slows tanks), crate stacks, trees, concrete blocks, sandbags, rocks and a central watch tower. The layout is fixed and mirrored left/right.
+- Four tank classes, picked in the **GARAGE** (menu button or `G`): Standard, Scout (fast, 2 armour), Heavy (slow, 5 armour), Gunner (8 rounds, rapid fire). Your choice is saved and sent to the host in LAN games; bots use a mix of classes.
+- How to Play is paged (PREV / NEXT, or the arrow keys).

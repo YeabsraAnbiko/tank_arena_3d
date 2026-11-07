@@ -20,14 +20,29 @@ opt-level = 3
 # Used by `cargo quad-apk` (Android). Audio and the font are embedded in the
 # binary with include_bytes!, so no Android asset folder is needed.
 [package.metadata.android]
-package_name = "org.tankarena.tank3d"
+package_name = "org.tankarena.tank_arena_3d"
 label = "Tank Arena 3D"
 version_name = "0.1.0"
 version_code = 1
 min_sdk_version = 21
 target_sdk_version = 33
 fullscreen = true
+icon = "@mipmap/ic_launcher"
+res = "res"
 build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
 
 [package.metadata.android.activity_attributes]
 "android:screenOrientation" = "sensorLandscape"
+"android:exported" = "true"
+
+[[package.metadata.android.permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"

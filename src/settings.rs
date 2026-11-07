@@ -12,11 +12,13 @@ pub struct Settings {
     pub chase_cam: bool,
     /// Mouse / touch look sensitivity multiplier.
     pub sens: f32,
+    /// Chosen tank class (index into sim::stats).
+    pub tank: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { name: "Player".into(), music: 0.5, sfx: 0.8, match_type: 2, chase_cam: false, sens: 1.0 }
+        Settings { name: "Player".into(), music: 0.5, sfx: 0.8, match_type: 2, chase_cam: false, sens: 1.0, tank: 0 }
     }
 }
 
@@ -41,6 +43,11 @@ impl Settings {
                 }
                 "chase" => s.chase_cam = v == "1" || v == "true",
                 "sens" => s.sens = v.parse::<f32>().unwrap_or(s.sens).clamp(0.3, 3.0),
+                "tank" => {
+                    if let Ok(t) = v.parse::<u8>() {
+                        s.tank = t.min(crate::sim::KINDS as u8 - 1);
+                    }
+                }
                 _ => {}
             }
         }
@@ -49,8 +56,8 @@ impl Settings {
 
     pub fn serialize(&self) -> String {
         format!(
-            "name={}\nmusic={:.2}\nsfx={:.2}\nmatchtype={}\nchase={}\nsens={:.1}\n",
-            self.name, self.music, self.sfx, self.match_type, self.chase_cam as u8, self.sens
+            "name={}\nmusic={:.2}\nsfx={:.2}\nmatchtype={}\nchase={}\nsens={:.1}\ntank={}\n",
+            self.name, self.music, self.sfx, self.match_type, self.chase_cam as u8, self.sens, self.tank
         )
     }
 
@@ -69,7 +76,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let s = Settings { name: "Zed".into(), music: 0.3, sfx: 0.0, match_type: 4, chase_cam: true, sens: 1.5 };
+        let s = Settings { name: "Zed".into(), music: 0.3, sfx: 0.0, match_type: 4, chase_cam: true, sens: 1.5, tank: 3 };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
 

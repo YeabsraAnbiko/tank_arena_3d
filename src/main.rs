@@ -38,6 +38,7 @@ enum Screen {
     Menu,
     Settings,
     HowTo,
+    Garage,
     Keyboard { target: KbTarget, text: String },
     Discovering,
     HostLobby,
@@ -79,6 +80,8 @@ struct App {
     touch: TouchCtl,
     touch_mode: bool,
     paused: bool,
+    help_page: usize,
+    garage_sel: u8,
     grabbed: bool,
     fire_armed: bool,
     last_mouse: Vec2,
@@ -100,7 +103,7 @@ struct TouchCtl {
 
 fn demo_world(seed: u64) -> World {
     let specs: Vec<PlayerSpec> = (0..4)
-        .map(|i| PlayerSpec { id: i, name: format!("Bot {}", i + 1), team: (i % 2) as u8, ai: true })
+        .map(|i| PlayerSpec { id: i, name: format!("Bot {}", i + 1), team: (i % 2) as u8, ai: true, kind: ((i as u64 + seed) % KINDS as u64) as u8 })
         .collect();
     World::new_match(&specs, seed)
 }
@@ -148,9 +151,10 @@ impl App {
     }
 
     fn start_practice(&mut self) {
-        let mut specs = vec![PlayerSpec { id: 0, name: self.settings.name.clone(), team: 0, ai: false }];
+        let mut specs = vec![PlayerSpec { id: 0, name: self.settings.name.clone(), team: 0, ai: false, kind: self.settings.tank }];
+        let pick = (get_time() * 1000.0) as u32;
         for i in 0..3 {
-            specs.push(PlayerSpec { id: 1 + i, name: format!("Bot {}", i + 1), team: 1, ai: true });
+            specs.push(PlayerSpec { id: 1 + i, name: format!("Bot {}", i + 1), team: 1, ai: true, kind: ((pick / 7 + i * 2 + i / 2) % KINDS as u32) as u8 });
         }
         self.begin_match(World::new_match(&specs, (get_time() * 1000.0) as u64 + 1), 0);
         self.mode = Mode::Offline;
@@ -175,7 +179,8 @@ impl App {
 
     fn start_host(&mut self) {
         match Host::new(PORT, &self.settings.name, self.settings.match_type) {
-            Ok(h) => {
+            Ok(mut h) => {
+                h.roster[0].kind = self.settings.tank;
                 self.mode = Mode::Host(h);
                 self.screen = Screen::HostLobby;
             }
@@ -185,7 +190,8 @@ impl App {
 
     fn start_join(&mut self) {
         match Client::new(PORT, &self.settings.name) {
-            Ok(c) => {
+            Ok(mut c) => {
+                c.kind = self.settings.tank;
                 self.mode = Mode::Client(c);
                 self.screen = Screen::Discovering;
                 self.status = "Searching for a host on your WiFi...".into();
@@ -304,6 +310,8 @@ async fn main() {
         touch: TouchCtl::default(),
         touch_mode: cfg!(target_os = "android") || std::env::var("TA_TOUCH").is_ok(),
         paused: false,
+        help_page: 0,
+        garage_sel: 0,
         grabbed: false,
         fire_armed: false,
         last_mouse: Vec2::ZERO,
@@ -357,6 +365,9 @@ async fn main() {
             run_play(&mut app, dt, &mut hold, force_hold.map_or(false, |(s, l)| frame >= s && frame < s + l), frame);
         } else {
             app.release_mouse();
+            if matches!(app.screen, Screen::Garage) {
+                run_menus(&mut app);
+            } else {
             // 3D bot battle as the menu backdrop
             app.demo.step(dt);
             app.demo.events.clear();
@@ -371,6 +382,7 @@ async fn main() {
             set_default_camera();
             draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.03, 0.05, 0.1, 0.62));
             run_menus(&mut app);
+            }
         }
 
         // toast
@@ -417,7 +429,10 @@ fn run_menus(app: &mut App) {
                 app.settings.save();
                 app.screen = Screen::Menu;
             }
-            Screen::HowTo => app.screen = Screen::Menu,
+            Screen::HowTo | Screen::Garage => {
+                app.help_page = 0;
+                app.screen = Screen::Menu;
+            }
             _ => app.leave_to_menu(),
         }
     }
@@ -429,41 +444,53 @@ fn run_menus(app: &mut App) {
             app.ui.title("TANK ARENA 3D", 110.0);
             app.ui.text("tap to fire  ·  hold to drive  ·  bounce your shots", cx, 175.0, 22.0, DIM, Align::Center);
             app.ui.text(&format!("Playing as {}", app.settings.name), cx, 205.0, 22.0, ACCENT, Align::Center);
-            let (w, h) = (460.0, 64.0);
+            let (w, h) = (460.0, 58.0);
             let x = cx - w / 2.0;
-            if app.ui.button(x, 245.0, w, h, "PRACTICE VS BOTS", Style::Primary) {
+            if app.ui.button(x, 235.0, w, h, "PRACTICE VS BOTS", Style::Primary) {
                 app.start_practice();
             }
-            if app.ui.button(x, 320.0, w, h, "HOST LAN GAME", Style::Normal) {
+            if app.ui.button(x, 300.0, w, h, "HOST LAN GAME", Style::Normal) {
                 app.start_host();
             }
-            if app.ui.button(x, 395.0, w, h, "JOIN LAN GAME", Style::Normal) {
+            if app.ui.button(x, 365.0, w, h, "JOIN LAN GAME", Style::Normal) {
                 app.start_join();
             }
+            let garage_label = format!("GARAGE: {}", stats(app.settings.tank).name);
+            if app.ui.button(x, 430.0, w, h, &garage_label, Style::Normal) {
+                app.garage_sel = app.settings.tank;
+                app.screen = Screen::Garage;
+                return;
+            }
             let half = (w - 12.0) / 2.0;
-            if app.ui.button(x, 470.0, half, h, "SETTINGS", Style::Normal) {
+            if app.ui.button(x, 495.0, half, h, "SETTINGS", Style::Normal) {
                 app.screen = Screen::Settings;
                 return;
             }
-            if app.ui.button(x + half + 12.0, 470.0, half, h, "HOW TO PLAY", Style::Normal) {
+            if app.ui.button(x + half + 12.0, 495.0, half, h, "HOW TO PLAY", Style::Normal) {
+                app.help_page = 0;
                 app.screen = Screen::HowTo;
                 return;
             }
-            if cfg!(not(target_os = "android")) && app.ui.button(x, 545.0, w, 52.0, "QUIT", Style::Danger) {
+            if cfg!(not(target_os = "android")) && app.ui.button(x, 560.0, w, 50.0, "QUIT", Style::Danger) {
                 app.quit = true;
             }
             if !app.touch_mode {
-                app.ui.text("1 PRACTICE  2 HOST  3 JOIN  S SETTINGS  H HELP  M MUSIC  F FULLSCREEN", cx, 660.0, 18.0, DIM, Align::Center);
+                app.ui.text("1 PRACTICE  2 HOST  3 JOIN  G GARAGE  S SETTINGS  H HELP", cx, 660.0, 18.0, DIM, Align::Center);
                 if is_key_pressed(KeyCode::Key1) || is_key_pressed(KeyCode::Enter) {
                     app.start_practice();
                 } else if is_key_pressed(KeyCode::Key2) {
                     app.start_host();
                 } else if is_key_pressed(KeyCode::Key3) {
                     app.start_join();
+                } else if is_key_pressed(KeyCode::G) {
+                    app.garage_sel = app.settings.tank;
+                    app.screen = Screen::Garage;
+                    return;
                 } else if is_key_pressed(KeyCode::S) {
                     app.screen = Screen::Settings;
                     return;
                 } else if is_key_pressed(KeyCode::H) {
+                    app.help_page = 0;
                     app.screen = Screen::HowTo;
                     return;
                 }
@@ -532,27 +559,158 @@ fn run_menus(app: &mut App) {
             }
         }
         Screen::HowTo => {
-            app.ui.title("HOW TO PLAY", 80.0);
-            app.ui.panel(190.0, 128.0, 900.0, 520.0);
-            let lines = [
-                ("MAP VIEW", "Tap anywhere to fire (your spin reverses). Hold to drive, release to spin again."),
-                ("CHASE", "WASD or arrows drive. Mouse or Q E aims the cannon. Click or Space fires. Shift boosts, R reloads."),
-                ("TOUCH", "Left stick drives, drag the right side to aim, hold FIRE. BOOST and R are buttons."),
-                ("SHOTS", "5 rounds, then a reload. Bullets ricochet twice. The dotted line shows your bounce."),
-                ("TEAMS", "Teammates cannot hurt each other. Last team standing wins."),
-                ("CRATES", "Drive over crates: repair, reload, nitro, rapid fire, shield."),
-                ("KEYS", "C view, Esc pause, M music, F fullscreen. LAN: one hosts, others tap JOIN."),
+            // Paged so nothing can run off the panel. Text shrinks if a page is still too tall.
+            let pages: [(&str, Vec<(String, String)>); 4] = [
+                (
+                    "CONTROLS",
+                    vec![
+                        ("MAP VIEW".into(), "Tap anywhere to fire (your spin reverses). Hold to drive, release to spin again.".into()),
+                        ("CHASE".into(), "W A S D or arrows move the tank the way you press, relative to the camera. Mouse or Q E aims. Click or Space fires.".into()),
+                        ("MORE".into(), "Shift boosts, R reloads, C switches view, Esc pauses, M music, F fullscreen.".into()),
+                        ("TOUCH".into(), "Left stick drives, drag the right side to aim, hold FIRE. BOOST and R are buttons.".into()),
+                    ],
+                ),
+                (
+                    "BATTLE",
+                    vec![
+                        ("SHOTS".into(), "A magazine, then a reload. Bullets ricochet twice. The dotted line previews your bounce.".into()),
+                        ("TEAMS".into(), "Teammates cannot hurt each other. The last team standing wins.".into()),
+                        ("PICKUPS".into(), "Drive over the glowing cubes: repair, reload, nitro, rapid fire, shield.".into()),
+                        ("LAN".into(), "One player hosts, the others tap JOIN on the same WiFi. Pick your tank in the garage first.".into()),
+                    ],
+                ),
+                (
+                    "THE FIELD",
+                    vec![
+                        ("WALLS".into(), "Bricks, crates, rocks, trees, sandbags, concrete blocks and the tower are solid. Shots bounce off them.".into()),
+                        ("WATER".into(), "Ponds stop tanks, but bullets fly right over them.".into()),
+                        ("MUD".into(), "Mud patches slow you down. Bullets ignore them, so cross quickly.".into()),
+                    ],
+                ),
+                (
+                    "TANKS",
+                    (0..KINDS as u8)
+                        .map(|k| {
+                            let st = stats(k);
+                            (st.name.to_string(), format!("{} - armour {}, {} rounds.", st.blurb, st.hp, st.ammo))
+                        })
+                        .collect(),
+                ),
             ];
-            let mut y = 166.0;
-            for (k, v) in lines.iter() {
-                app.ui.text(k, 225.0, y, 26.0, ACCENT, Align::Left);
-                let wrapped = app.ui.wrap(v, 26.0, 700.0);
-                for (li, l) in wrapped.iter().enumerate() {
-                    app.ui.text(l, 380.0, y + li as f32 * 24.0, 26.0, TEXT, Align::Left);
+            let np = pages.len();
+            app.help_page = app.help_page.min(np - 1);
+            let (head, lines) = &pages[app.help_page];
+            app.ui.title("HOW TO PLAY", 70.0);
+            let (px, py, pw, ph) = (140.0, 118.0, 1000.0, 478.0);
+            app.ui.panel(px, py, pw, ph);
+            app.ui.text(&format!("{}  {}/{}", head, app.help_page + 1, np), cx, py + 30.0, 28.0, TEXT, Align::Center);
+            let label_w = 230.0;
+            let text_w = pw - label_w - 70.0;
+            let avail = ph - 80.0;
+            // pick the biggest text size whose wrapped lines fit the panel
+            let mut size = 26.0f32;
+            let layout = loop {
+                let lh = size * 0.95;
+                let mut total = 0.0;
+                let mut rows = Vec::new();
+                for (k, v) in lines.iter() {
+                    let wrapped = app.ui.wrap(v, size, text_w);
+                    total += wrapped.len().max(1) as f32 * lh + 16.0;
+                    rows.push((k.clone(), wrapped));
                 }
-                y += (wrapped.len().max(1) as f32) * 24.0 + 18.0;
+                if total <= avail || size <= 16.0 {
+                    break (rows, lh);
+                }
+                size -= 2.0;
+            };
+            let mut y = py + 78.0;
+            for (k, wrapped) in layout.0.iter() {
+                app.ui.text_fit(k, px + 30.0, y, size, ACCENT, Align::Left, label_w - 10.0);
+                for (li, l) in wrapped.iter().enumerate() {
+                    app.ui.text_fit(l, px + label_w + 30.0, y + li as f32 * layout.1, size, TEXT, Align::Left, text_w + 20.0);
+                }
+                y += wrapped.len().max(1) as f32 * layout.1 + 16.0;
             }
-            if app.ui.button(cx - 150.0, 656.0, 300.0, 52.0, "BACK", Style::Primary) {
+            let by = 616.0;
+            if app.ui.button(px, by, 220.0, 54.0, "< PREV", if app.help_page > 0 { Style::Normal } else { Style::Disabled }) && app.help_page > 0 {
+                app.help_page -= 1;
+            }
+            if app.ui.button(px + pw - 220.0, by, 220.0, 54.0, "NEXT >", if app.help_page + 1 < np { Style::Normal } else { Style::Disabled }) && app.help_page + 1 < np {
+                app.help_page += 1;
+            }
+            if app.ui.button(cx - 130.0, by, 260.0, 54.0, "BACK", Style::Primary) {
+                app.help_page = 0;
+                app.screen = Screen::Menu;
+                return;
+            }
+            if is_key_pressed(KeyCode::Right) && app.help_page + 1 < np {
+                app.help_page += 1;
+            }
+            if is_key_pressed(KeyCode::Left) && app.help_page > 0 {
+                app.help_page -= 1;
+            }
+        }
+        Screen::Garage => {
+            let t = get_time() as f32;
+            // backdrop
+            let (sw, sh) = (screen_width(), screen_height());
+            draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.07, 0.10, 0.16, 1.0));
+            draw_rectangle(0.0, sh * 0.62, sw, sh * 0.38, Color::new(0.10, 0.15, 0.17, 1.0));
+            let sel = app.garage_sel.min(KINDS as u8 - 1);
+            let cam = Camera3D {
+                position: vec3(2.9, 2.2, 4.4),
+                target: vec3(1.7, 0.3, 0.0),
+                up: vec3(0.0, 1.0, 0.0),
+                fovy: 38f32.to_radians(),
+                ..Default::default()
+            };
+            set_camera(&cam);
+            let mut b = Batch::new();
+            b.cyl(vec3(0.0, -0.05, 0.0), 1.5, 0.1, Color::new(0.2, 0.22, 0.26, 1.0));
+            b.cyl(vec3(0.0, -0.01, 0.0), 1.38, 0.04, Color::new(0.3, 0.32, 0.37, 1.0));
+            let mut tank = Tank::new(0, 0, "", ARENA_W / 2.0, ARENA_H / 2.0, t * 0.55, false);
+            tank.set_kind(sel);
+            tank.turret = tank.angle + (t * 0.8).sin() * 0.5;
+            app.scene.draw_tank(&mut b, &tank, 0, t, (t * 0.6, t * 0.6), false);
+            b.flush();
+            set_default_camera();
+
+            app.ui.title("GARAGE", 62.0);
+            let st = stats(sel);
+            let (px, py, pw, ph) = (700.0, 130.0, 500.0, 470.0);
+            app.ui.panel(px, py, pw, ph);
+            app.ui.text_fit(st.name, px + pw / 2.0, py + 40.0, 44.0, ACCENT, Align::Center, pw - 40.0);
+            for (i, l) in app.ui.wrap(st.blurb, 24.0, pw - 60.0).iter().enumerate() {
+                app.ui.text(l, px + pw / 2.0, py + 90.0 + i as f32 * 26.0, 24.0, TEXT, Align::Center);
+            }
+            let bars = [
+                ("ARMOUR", st.hp as f32 / 5.0, format!("{}", st.hp)),
+                ("SPEED", st.speed / 145.0, format!("{:.0}", st.speed)),
+                ("FIRE RATE", (1.0 / st.cooldown) / 11.2, format!("{:.1}/s", 1.0 / st.cooldown)),
+                ("MAGAZINE", st.ammo as f32 / 8.0, format!("{}", st.ammo)),
+                ("RELOAD", 1.0 - (st.reload - 1.0) / 1.6, format!("{:.1}s", st.reload)),
+            ];
+            for (i, (name, f, val)) in bars.iter().enumerate() {
+                let y = py + 150.0 + i as f32 * 50.0;
+                app.ui.text(name, px + 30.0, y + 12.0, 22.0, DIM, Align::Left);
+                app.ui.fill(px + 190.0, y, 190.0, 22.0, Color::new(0.2, 0.22, 0.28, 1.0));
+                app.ui.fill(px + 190.0, y, 190.0 * f.clamp(0.04, 1.0), 22.0, Color::new(0.95, 0.7, 0.2, 1.0));
+                app.ui.text(val, px + 392.0, y + 12.0, 20.0, TEXT, Align::Left);
+            }
+            let by = py + ph - 62.0;
+            if app.ui.button(px + 20.0, by, 90.0, 50.0, "<", Style::Normal) || is_key_pressed(KeyCode::Left) {
+                app.garage_sel = (sel + KINDS as u8 - 1) % KINDS as u8;
+            }
+            if app.ui.button(px + pw - 110.0, by, 90.0, 50.0, ">", Style::Normal) || is_key_pressed(KeyCode::Right) {
+                app.garage_sel = (sel + 1) % KINDS as u8;
+            }
+            let chosen = app.settings.tank == sel;
+            let lab = if chosen { "SELECTED" } else { "SELECT" };
+            if app.ui.button(px + 130.0, by, pw - 260.0, 50.0, lab, if chosen { Style::Disabled } else { Style::Primary }) && !chosen || (is_key_pressed(KeyCode::Enter) && !chosen) {
+                app.settings.tank = sel;
+                app.settings.save();
+            }
+            if app.ui.button(60.0, 636.0, 260.0, 54.0, "BACK", Style::Normal) {
                 app.screen = Screen::Menu;
                 return;
             }
@@ -773,20 +931,27 @@ const STICK_R: f32 = 95.0;
 fn gather_drive(app: &mut App, dt: f32, frame: u64) -> Control {
     let kd = is_key_down;
     let mut c = Control { drive: true, ..Default::default() };
-    let mut steer = 0.0f32;
-    let mut throttle = 0.0f32;
+    // car-style: W/A/S/D mean "go that way on screen" (relative to the camera).
+    let mut right = 0.0f32;
+    let mut fwd = 0.0f32;
     if kd(KeyCode::D) || kd(KeyCode::Right) {
-        steer += 1.0;
+        right += 1.0;
     }
     if kd(KeyCode::A) || kd(KeyCode::Left) {
-        steer -= 1.0;
+        right -= 1.0;
     }
     if kd(KeyCode::W) || kd(KeyCode::Up) {
-        throttle += 1.0;
+        fwd += 1.0;
     }
     if kd(KeyCode::S) || kd(KeyCode::Down) {
-        throttle -= 1.0;
+        fwd -= 1.0;
     }
+    let hull = app.world.tank(app.my_id).map(|t| t.angle).unwrap_or(0.0);
+    let (mut steer, mut throttle) = if right != 0.0 || fwd != 0.0 {
+        screen_drive(app.aim, hull, right, fwd, 1.0)
+    } else {
+        (0.0, 0.0)
+    };
     c.fire = kd(KeyCode::Space);
     c.boost = kd(KeyCode::LeftShift) || kd(KeyCode::RightShift);
     c.reload = kd(KeyCode::R);
@@ -832,6 +997,18 @@ fn gather_drive(app: &mut App, dt: f32, frame: u64) -> Control {
     c.throttle = throttle.clamp(-1.0, 1.0);
     c.aim = app.aim;
     c
+}
+
+/// Turn a screen-relative direction (right, forward) into hull steer/throttle.
+/// The tank turns toward that direction and drives; if the direction is mostly
+/// behind it, it reverses toward it instead of making a U-turn.
+fn screen_drive(aim: f32, hull: f32, right: f32, fwd: f32, mag: f32) -> (f32, f32) {
+    let target = aim + right.atan2(fwd);
+    let diff = wrap(target - hull);
+    let (err, sign) = if diff.abs() > 1.9 { (wrap(diff + std::f32::consts::PI), -1.0) } else { (diff, 1.0) };
+    let steer = (err * 3.0).clamp(-1.0, 1.0);
+    let go = if err.abs() < 1.2 { err.cos().max(0.0) } else { 0.0 };
+    (steer, sign * mag * go.max(0.1))
 }
 
 /// Twin-stick touch input: a floating stick on the left drives (push toward
@@ -895,10 +1072,9 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
         app.touch.knob = d;
         let m = (d.length() / STICK_R).min(1.0);
         if m > 0.18 {
-            let target = app.aim + d.x.atan2(-d.y);
-            let diff = wrap(target - hull);
-            steer = (diff * 2.5).clamp(-1.0, 1.0);
-            throttle = m * if diff.abs() < 1.3 { 1.0 } else { 0.15 };
+            let r = screen_drive(app.aim, hull, d.x, -d.y, m);
+            steer = r.0;
+            throttle = r.1;
         }
     } else {
         app.touch.knob = Vec2::ZERO;
@@ -1261,17 +1437,17 @@ fn draw_hud(app: &mut App, me_alive: bool) {
             let py = if drive && app.touch_mode { 20.0 + 70.0 } else { 600.0 };
             let (px, ph) = if drive { (16.0, 112.0) } else { (16.0, 104.0) };
             ui.fill(px, py, 430.0, ph, Color::new(0.0, 0.0, 0.0, 0.5));
-            for i in 0..TANK_HP {
+            for i in 0..t.max_hp() {
                 let c = if i < t.hp { Color::new(0.4, 1.0, 0.45, 1.0) } else { Color::new(0.25, 0.3, 0.25, 1.0) };
                 ui.fill(30.0 + i as f32 * 40.0, py + 14.0, 32.0, 24.0, c);
             }
             if t.reloading() {
-                let f = 1.0 - t.reload / RELOAD_TIME;
+                let f = 1.0 - t.reload / t.reload_time();
                 ui.fill(30.0, py + 52.0, 220.0, 20.0, Color::new(0.2, 0.2, 0.2, 1.0));
                 ui.fill(30.0, py + 52.0, 220.0 * f, 20.0, Color::new(1.0, 0.7, 0.2, 1.0));
                 ui.text("RELOADING", 262.0, py + 62.0, 20.0, ACCENT, Align::Left);
             } else {
-                for i in 0..MAX_AMMO {
+                for i in 0..t.max_ammo() {
                     let c = if i < t.ammo { Color::new(1.0, 0.85, 0.3, 1.0) } else { Color::new(0.3, 0.3, 0.3, 1.0) };
                     ui.fill(30.0 + i as f32 * 36.0, py + 52.0, 26.0, 20.0, c);
                 }
@@ -1310,5 +1486,24 @@ fn draw_hud(app: &mut App, me_alive: bool) {
             (true, true) => "LEFT STICK DRIVE   DRAG RIGHT TO AIM",
         };
         ui.text_fit(hint, VW / 2.0, if drive && app.touch_mode { 250.0 } else { 120.0 }, 28.0, Color::new(1.0, 1.0, 1.0, (8.0 - app.play_time).min(1.0)), Align::Center, 1200.0);
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+    #[test]
+    fn screen_relative() {
+        // facing the camera's forward: W drives forward, no steering
+        let (s, t) = screen_drive(0.0, 0.0, 0.0, 1.0, 1.0);
+        assert!(s.abs() < 1e-3 && t > 0.9);
+        // D (screen right) while facing forward: steer right (positive angle), still moving
+        let (s, t) = screen_drive(0.0, 0.0, 1.0, 0.0, 1.0);
+        assert!(s > 0.5 && t > 0.0 && t < 0.5);
+        // A: steer left
+        assert!(screen_drive(0.0, 0.0, -1.0, 0.0, 1.0).0 < -0.5);
+        // S while facing forward: reverse straight back, no spin
+        let (s, t) = screen_drive(0.0, 0.0, 0.0, -1.0, 1.0);
+        assert!(s.abs() < 1e-3 && t < -0.9);
     }
 }

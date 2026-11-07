@@ -1,13 +1,13 @@
 //! Headless game simulation. No rendering, no networking, no macroquad.
 //!
-//! The simulation lives on a flat 960x640 plane (x, y). The renderer maps
+//! The simulation lives on a flat 1440x800 plane (x, y). The renderer maps
 //! it onto the XZ ground plane in 3D. Keeping the rules here makes them
 //! unit-testable and lets the LAN host and the offline mode share them.
 
 use std::f32::consts::PI;
 
-pub const ARENA_W: f32 = 960.0;
-pub const ARENA_H: f32 = 640.0;
+pub const ARENA_W: f32 = 1440.0;
+pub const ARENA_H: f32 = 800.0;
 
 pub const TANK_R: f32 = 18.0;
 pub const TANK_SPEED: f32 = 110.0;
@@ -36,6 +36,32 @@ pub const BOOST_REGEN: f32 = 1.0 / 3.5;
 pub const TURRET_RATE: f32 = 7.0;
 /// Delay between the last kill and the game-over screen so the explosion plays.
 pub const END_DELAY: f32 = 1.5;
+/// Slow-down factor while a tank sits in mud.
+pub const MUD_MULT: f32 = 0.55;
+
+/// Selectable tank classes.
+pub const KINDS: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+pub struct TankStats {
+    pub name: &'static str,
+    pub blurb: &'static str,
+    pub hp: i32,
+    pub speed: f32,
+    pub turn: f32,
+    pub ammo: i32,
+    pub cooldown: f32,
+    pub reload: f32,
+}
+
+pub fn stats(kind: u8) -> TankStats {
+    match kind {
+        1 => TankStats { name: "SCOUT", blurb: "Fast and nimble, thin armour", hp: 2, speed: 142.0, turn: 1.25, ammo: 5, cooldown: 0.15, reload: 1.3 },
+        2 => TankStats { name: "HEAVY", blurb: "Slow but very tough", hp: 5, speed: 84.0, turn: 0.8, ammo: 4, cooldown: 0.30, reload: 2.1 },
+        3 => TankStats { name: "GUNNER", blurb: "Big magazine, rapid fire", hp: 3, speed: 100.0, turn: 1.0, ammo: 8, cooldown: 0.09, reload: 2.4 },
+        _ => TankStats { name: "STANDARD", blurb: "Balanced all-rounder", hp: TANK_HP, speed: TANK_SPEED, turn: 1.0, ammo: MAX_AMMO, cooldown: FIRE_COOLDOWN, reload: RELOAD_TIME },
+    }
+}
 
 // ---------------------------------------------------------------- rng ----
 
@@ -127,6 +153,17 @@ pub struct Pickup {
 pub enum ObstacleKind {
     Rock,
     Sandbag,
+    /// Stack of wooden crates.
+    Crate,
+    /// Water: tanks cannot enter, bullets fly over it.
+    Pond,
+    /// Mud: slows tanks, bullets ignore it.
+    Mud,
+    Tree,
+    /// Watch tower on stilts-like pillars (solid).
+    Tower,
+    /// Concrete barrier.
+    Block,
 }
 
 #[derive(Clone, Debug)]
@@ -138,22 +175,53 @@ pub struct Obstacle {
     pub kind: ObstacleKind,
 }
 
-/// Fixed, left/right symmetric layout. Spawn lanes (x < 150 and x > 810) stay
+impl Obstacle {
+    /// Tanks cannot drive through it.
+    pub fn solid_tank(&self) -> bool {
+        self.kind != ObstacleKind::Mud
+    }
+    /// Bullets bounce off it.
+    pub fn solid_bullet(&self) -> bool {
+        !matches!(self.kind, ObstacleKind::Mud | ObstacleKind::Pond)
+    }
+    /// Tall enough to block the chase camera.
+    pub fn tall(&self) -> bool {
+        self.solid_bullet()
+    }
+}
+
+/// Fixed, left/right symmetric layout. Spawn lanes (x < 150 and x > 1290) stay
 /// clear. Because it is fixed, it never has to be sent over the network.
 pub fn default_obstacles() -> Vec<Obstacle> {
     use ObstacleKind::*;
-    let o = |x, y, w, h, kind| Obstacle { x, y, w, h, kind };
-    vec![
-        o(440.0, 280.0, 80.0, 80.0, Rock),
-        o(250.0, 120.0, 40.0, 100.0, Sandbag),
-        o(670.0, 120.0, 40.0, 100.0, Sandbag),
-        o(250.0, 420.0, 40.0, 100.0, Sandbag),
-        o(670.0, 420.0, 40.0, 100.0, Sandbag),
-        o(330.0, 300.0, 50.0, 40.0, Rock),
-        o(580.0, 300.0, 50.0, 40.0, Rock),
-        o(440.0, 80.0, 80.0, 30.0, Sandbag),
-        o(440.0, 530.0, 80.0, 30.0, Sandbag),
-    ]
+    let o = |x: f32, y: f32, w: f32, h: f32, kind| Obstacle { x, y, w, h, kind };
+    // left half; every item is mirrored to the right side
+    let left = [
+        o(480.0, 150.0, 60.0, 60.0, Crate),
+        o(480.0, 590.0, 60.0, 60.0, Crate),
+        o(330.0, 140.0, 40.0, 120.0, Sandbag),
+        o(330.0, 540.0, 40.0, 120.0, Sandbag),
+        o(230.0, 340.0, 130.0, 120.0, Pond),
+        o(540.0, 440.0, 150.0, 130.0, Mud),
+        o(540.0, 230.0, 150.0, 110.0, Mud),
+        o(590.0, 360.0, 60.0, 60.0, Rock),
+        o(200.0, 90.0, 30.0, 30.0, Tree),
+        o(200.0, 680.0, 30.0, 30.0, Tree),
+        o(420.0, 330.0, 30.0, 30.0, Tree),
+        o(420.0, 470.0, 30.0, 30.0, Tree),
+        o(600.0, 160.0, 80.0, 30.0, Block),
+        o(600.0, 610.0, 80.0, 30.0, Block),
+    ];
+    let mut v = Vec::new();
+    for ob in left.iter() {
+        v.push(ob.clone());
+        v.push(Obstacle { x: ARENA_W - ob.x - ob.w, ..ob.clone() });
+    }
+    // centre pieces (self-symmetric)
+    v.push(o(680.0, 360.0, 80.0, 80.0, Tower));
+    v.push(o(620.0, 60.0, 200.0, 30.0, Sandbag));
+    v.push(o(620.0, 710.0, 200.0, 30.0, Sandbag));
+    v
 }
 
 // --------------------------------------------------------------- tanks ----
@@ -259,6 +327,8 @@ pub struct Tank {
     /// Boost stamina, 0..1.
     pub stamina: f32,
     boost_lock: bool,
+    pub kind: u8,
+    pub mud: bool,
     pub ctrl: Control,
     pub ai: Option<Ai>,
 }
@@ -288,6 +358,8 @@ impl Tank {
             turret: angle,
             stamina: 1.0,
             boost_lock: false,
+            kind: 0,
+            mud: false,
             ctrl: Control::default(),
             ai: if ai {
                 Some(Ai { mode: AiMode::Idle, fire_wait: 1.0, drive_wait: 1.5 })
@@ -297,14 +369,29 @@ impl Tank {
         }
     }
 
+    /// Switch to a tank class (resets hp and ammo to that class's maximum).
+    pub fn set_kind(&mut self, kind: u8) {
+        self.kind = if (kind as usize) < KINDS { kind } else { 0 };
+        self.hp = self.max_hp();
+        self.ammo = self.max_ammo();
+    }
+    pub fn max_hp(&self) -> i32 {
+        stats(self.kind).hp
+    }
+    pub fn max_ammo(&self) -> i32 {
+        stats(self.kind).ammo
+    }
+    pub fn reload_time(&self) -> f32 {
+        stats(self.kind).reload
+    }
     pub fn reloading(&self) -> bool {
         self.reload > 0.0
     }
     pub fn speed(&self) -> f32 {
-        TANK_SPEED * if self.speed_t > 0.0 { SPEED_MULT } else { 1.0 }
+        stats(self.kind).speed * if self.speed_t > 0.0 { SPEED_MULT } else { 1.0 } * if self.mud { MUD_MULT } else { 1.0 }
     }
     pub fn cooldown_len(&self) -> f32 {
-        FIRE_COOLDOWN * if self.rapid_t > 0.0 { RAPID_MULT } else { 1.0 }
+        stats(self.kind).cooldown * if self.rapid_t > 0.0 { RAPID_MULT } else { 1.0 }
     }
     pub fn can_fire(&self) -> bool {
         self.alive && self.ammo > 0 && !self.reloading() && self.cooldown <= 0.0
@@ -377,6 +464,7 @@ pub struct PlayerSpec {
     pub name: String,
     pub team: u8,
     pub ai: bool,
+    pub kind: u8,
 }
 
 // -------------------------------------------------------------- world ----
@@ -449,7 +537,9 @@ impl World {
             for (k, s) in members.iter().enumerate() {
                 let y = ARENA_H * (k as f32 + 1.0) / (n as f32 + 1.0);
                 let (x, angle) = if team == 0 { (90.0, 0.0) } else { (ARENA_W - 90.0, PI) };
-                tanks.push(Tank::new(s.id, s.team, &s.name, x, y, angle, s.ai));
+                let mut t = Tank::new(s.id, s.team, &s.name, x, y, angle, s.ai);
+                t.set_kind(s.kind);
+                tanks.push(t);
             }
         }
         World {
@@ -544,7 +634,7 @@ impl World {
             t.reload -= dt;
             if t.reload <= 0.0 {
                 t.reload = 0.0;
-                t.ammo = MAX_AMMO;
+                t.ammo = t.max_ammo();
             }
         }
         t.speed_t = (t.speed_t - dt).max(0.0);
@@ -582,7 +672,7 @@ impl World {
             t.x += t.angle.cos() * s;
             t.y += t.angle.sin() * s;
         } else {
-            t.angle = wrap_angle(t.angle + t.rot_dir * TANK_ROT * dt);
+            t.angle = wrap_angle(t.angle + t.rot_dir * TANK_ROT * stats(t.kind).turn * dt);
         }
         t.turret = t.angle;
     }
@@ -597,7 +687,7 @@ impl World {
         t.was_held = false;
         t.hold_timer = 0.0;
 
-        t.angle = wrap_angle(t.angle + c.steer.clamp(-1.0, 1.0) * DRIVE_TURN * dt);
+        t.angle = wrap_angle(t.angle + c.steer.clamp(-1.0, 1.0) * DRIVE_TURN * stats(t.kind).turn * dt);
         let th = c.throttle.clamp(-1.0, 1.0);
         let mut speed = t.speed() * th.abs() * if th < 0.0 { REVERSE_MULT } else { 1.0 };
 
@@ -621,8 +711,8 @@ impl World {
         let step = TURRET_RATE * dt;
         t.turret = wrap_angle(t.turret + d.clamp(-step, step));
 
-        if c.reload && t.ammo < MAX_AMMO && !t.reloading() {
-            t.reload = RELOAD_TIME;
+        if c.reload && t.ammo < t.max_ammo() && !t.reloading() {
+            t.reload = t.reload_time();
         }
         if c.fire {
             Self::fire(t, out, events);
@@ -649,19 +739,23 @@ impl World {
         t.ammo -= 1;
         t.cooldown = t.cooldown_len();
         if t.ammo <= 0 {
-            t.reload = RELOAD_TIME;
+            t.reload = t.reload_time();
         }
         true
     }
 
     fn collide_tanks(&mut self) {
         for t in self.tanks.iter_mut().filter(|t| t.alive) {
-            for o in &self.obstacles {
+            for o in self.obstacles.iter().filter(|o| o.solid_tank()) {
                 if let Some((nx, ny, _, _)) = circle_rect(t.x, t.y, TANK_R, o) {
                     t.x = nx;
                     t.y = ny;
                 }
             }
+            t.mud = self
+                .obstacles
+                .iter()
+                .any(|o| o.kind == ObstacleKind::Mud && t.x > o.x && t.x < o.x + o.w && t.y > o.y && t.y < o.y + o.h);
             t.x = t.x.clamp(TANK_R, ARENA_W - TANK_R);
             t.y = t.y.clamp(TANK_R, ARENA_H - TANK_R);
         }
@@ -753,7 +847,7 @@ impl World {
             b.vy = -b.vy.abs();
             bounced = true;
         }
-        for o in obstacles {
+        for o in obstacles.iter().filter(|o| o.solid_bullet()) {
             if let Some((nx, ny, ux, uy)) = circle_rect(b.x, b.y, BULLET_R, o) {
                 b.x = nx;
                 b.y = ny;
@@ -831,9 +925,9 @@ impl World {
 
     pub fn apply_pickup(t: &mut Tank, kind: PickupKind) {
         match kind {
-            PickupKind::Heal => t.hp = (t.hp + 1).min(TANK_HP),
+            PickupKind::Heal => t.hp = (t.hp + 1).min(t.max_hp()),
             PickupKind::Ammo => {
-                t.ammo = MAX_AMMO;
+                t.ammo = t.max_ammo();
                 t.reload = 0.0;
             }
             PickupKind::Speed => t.speed_t = BUFF_TIME,
@@ -846,7 +940,7 @@ impl World {
         for _ in 0..30 {
             let x = self.rng.range(70.0, ARENA_W - 70.0);
             let y = self.rng.range(70.0, ARENA_H - 70.0);
-            let blocked = self.obstacles.iter().any(|o| circle_rect(x, y, PICKUP_R + 14.0, o).is_some());
+            let blocked = self.obstacles.iter().any(|o| o.kind != ObstacleKind::Mud && circle_rect(x, y, PICKUP_R + 14.0, o).is_some());
             let near_tank = self.tanks.iter().any(|t| t.alive && (t.x - x).hypot(t.y - y) < 60.0);
             let near_pickup = self.pickups.iter().any(|p| (p.x - x).hypot(p.y - y) < 60.0);
             if !blocked && !near_tank && !near_pickup {
@@ -1044,7 +1138,7 @@ mod tests {
     use super::*;
 
     fn spec(id: u32, team: u8, ai: bool) -> PlayerSpec {
-        PlayerSpec { id, name: format!("P{id}"), team, ai }
+        PlayerSpec { id, name: format!("P{id}"), team, ai, kind: 0 }
     }
 
     fn duel() -> World {
@@ -1207,7 +1301,7 @@ mod tests {
             }
             assert!(w.pickups.len() <= MAX_PICKUPS);
             for p in &w.pickups {
-                assert!(!w.obstacles.iter().any(|o| circle_rect(p.x, p.y, PICKUP_R, o).is_some()));
+                assert!(!w.obstacles.iter().any(|o| o.kind != ObstacleKind::Mud && circle_rect(p.x, p.y, PICKUP_R, o).is_some()));
             }
         }
         assert!(!w.pickups.is_empty(), "something should have spawned");
@@ -1487,15 +1581,20 @@ mod tests {
         // Aimed straight at the enemy tank along a clear lane (the middle is
         // blocked by the central rock).
         let mut w = duel();
-        w.tank_mut(0).unwrap().y = 600.0;
-        w.tank_mut(1).unwrap().y = 600.0;
-        let (pts, hit) = w.trace_shot(90.0, 600.0, 0.0, 0);
+        let lane = (30..770)
+            .step_by(5)
+            .map(|y| y as f32)
+            .find(|&y| !w.obstacles.iter().any(|o| o.solid_tank() && y + 30.0 > o.y && y - 30.0 < o.y + o.h))
+            .expect("a clear lane exists");
+        w.tank_mut(0).unwrap().y = lane;
+        w.tank_mut(1).unwrap().y = lane;
+        let (pts, hit) = w.trace_shot(90.0, lane, 0.0, 0);
         assert!(hit, "line ends on the enemy");
         assert_eq!(pts.len(), 2, "no bounces on the way: {pts:?}");
-        assert!(pts.last().unwrap().0 > 800.0);
+        assert!(pts.last().unwrap().0 > ARENA_W - 160.0);
         // The same shot is not flagged when the target is a teammate.
         w.tank_mut(1).unwrap().team = 0;
-        let (_, hit) = w.trace_shot(90.0, 600.0, 0.0, 0);
+        let (_, hit) = w.trace_shot(90.0, lane, 0.0, 0);
         assert!(!hit, "teammates are passed through");
     }
 
@@ -1510,5 +1609,77 @@ mod tests {
         b.apply_state(&msg).expect("parse");
         assert!((b.tank(0).unwrap().turret - 1.25).abs() < 0.01);
         assert!((b.tank(0).unwrap().stamina - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn layout_is_symmetric_and_keeps_spawns_clear() {
+        let obs = default_obstacles();
+        for o in &obs {
+            assert!(o.x >= 0.0 && o.y >= 0.0 && o.x + o.w <= ARENA_W && o.y + o.h <= ARENA_H, "{o:?} inside the arena");
+            if o.solid_tank() {
+                assert!(o.x > 160.0 && o.x + o.w < ARENA_W - 160.0, "spawn lanes clear: {o:?}");
+            }
+            let m = (ARENA_W - o.x - o.w, o.y);
+            assert!(obs.iter().any(|q| q.kind == o.kind && (q.x - m.0).abs() < 0.5 && (q.y - m.1).abs() < 0.5), "mirror of {o:?}");
+        }
+        // solid pieces never overlap each other
+        let solid: Vec<_> = obs.iter().filter(|o| o.solid_tank()).collect();
+        for (i, a) in solid.iter().enumerate() {
+            for b in solid.iter().skip(i + 1) {
+                let apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ponds_block_tanks_but_not_bullets_and_mud_slows() {
+        let pond = Obstacle { x: 400.0, y: 300.0, w: 100.0, h: 100.0, kind: ObstacleKind::Pond };
+        let mud = Obstacle { x: 600.0, y: 300.0, w: 100.0, h: 100.0, kind: ObstacleKind::Mud };
+        let mut w = duel();
+        w.obstacles = vec![pond, mud];
+        // a bullet flies straight over the pond
+        let mut b = Bullet { x: 390.0, y: 350.0, vx: BULLET_SPEED, vy: 0.0, bounces: 0, owner: 9, team: 0 };
+        for _ in 0..30 {
+            World::bounce(&w.obstacles, &mut b);
+            b.x += b.vx * 0.01;
+        }
+        assert!(b.vx > 0.0 && b.x > 500.0, "bullet passes over water");
+        // a tank pushed into the pond is shoved back out
+        {
+            let t = w.tank_mut(0).unwrap();
+            t.x = 450.0;
+            t.y = 350.0;
+        }
+        w.collide_tanks();
+        let t = w.tank(0).unwrap();
+        assert!(!(t.x > 400.0 && t.x < 500.0 && t.y > 300.0 && t.y < 400.0), "tank left the water: ({}, {})", t.x, t.y);
+        // mud slows
+        {
+            let t = w.tank_mut(1).unwrap();
+            t.x = 650.0;
+            t.y = 350.0;
+        }
+        w.collide_tanks();
+        assert!(w.tank(1).unwrap().mud);
+        assert!(w.tank(1).unwrap().speed() < TANK_SPEED * 0.6);
+    }
+
+    #[test]
+    fn tank_classes_have_their_own_stats() {
+        let mut specs = [spec(0, 0, false), spec(1, 1, false)];
+        specs[0].kind = 2;
+        specs[1].kind = 1;
+        let w = World::new_match(&specs, 3);
+        let (h, s) = (w.tank(0).unwrap(), w.tank(1).unwrap());
+        assert_eq!((h.hp, h.max_hp()), (5, 5));
+        assert_eq!((s.hp, s.max_hp()), (2, 2));
+        assert!(s.speed() > h.speed());
+        let mut g = Tank::new(5, 0, "g", 100.0, 100.0, 0.0, false);
+        g.set_kind(3);
+        assert_eq!((g.ammo, g.max_ammo()), (8, 8));
+        assert!(g.cooldown_len() < Tank::new(6, 0, "n", 0.0, 0.0, 0.0, false).cooldown_len());
+        g.set_kind(99);
+        assert_eq!(g.kind, 0, "unknown kinds fall back to standard");
     }
 }

@@ -2,11 +2,11 @@
 //! match and broadcasts snapshots; clients send a single "held" boolean.
 //!
 //! Wire protocol (UTF-8 text, fields split on ':'):
-//!   client -> host   JOIN:<name>   INPUT:<control csv>   LEAVE   DISCOVER
+//!   client -> host   JOIN:<name>:<tank kind>   INPUT:<control csv>   LEAVE   DISCOVER
 //!                    (control csv = sim::Control::encode; legacy INPUT:0|1 still works)
 //!   host -> client   WELCOME:<id>  REJECT:<reason>
 //!                    HELLO:<host name>:<players>:<capacity>:<match type>:<in game 0|1>
-//!                    LOBBY:<match type>:<id,name,team;...>
+//!                    LOBBY:<match type>:<id,name,team,kind;...>
 //!                    STATE:...  (see sim::World::encode_state)
 //!
 //! Only std::net is used, so it behaves the same on Linux, Windows, Android.
@@ -16,7 +16,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::sim::{Control, Event, PlayerSpec, World};
+use crate::sim::{Control, Event, PlayerSpec, World, KINDS};
 
 pub const PORT: u16 = 22122;
 pub const TIMEOUT: Duration = Duration::from_secs(6);
@@ -41,10 +41,11 @@ pub struct RosterEntry {
     pub id: u32,
     pub name: String,
     pub team: u8,
+    pub kind: u8,
 }
 
 pub fn roster_to_specs(r: &[RosterEntry]) -> Vec<PlayerSpec> {
-    r.iter().map(|e| PlayerSpec { id: e.id, name: e.name.clone(), team: e.team, ai: false }).collect()
+    r.iter().map(|e| PlayerSpec { id: e.id, name: e.name.clone(), team: e.team, ai: false, kind: e.kind }).collect()
 }
 
 /// Players per team for a match type: 1v1, 2v2, 4v4.
@@ -53,17 +54,18 @@ pub fn capacity(match_type: u8) -> usize {
 }
 
 fn encode_roster(r: &[RosterEntry]) -> String {
-    r.iter().map(|e| format!("{},{},{}", e.id, e.name, e.team)).collect::<Vec<_>>().join(";")
+    r.iter().map(|e| format!("{},{},{},{}", e.id, e.name, e.team, e.kind)).collect::<Vec<_>>().join(";")
 }
 
 fn decode_roster(s: &str) -> Vec<RosterEntry> {
     s.split(';')
         .filter_map(|rec| {
             let f: Vec<&str> = rec.split(',').collect();
-            if f.len() != 3 {
+            if f.len() != 3 && f.len() != 4 {
                 return None;
             }
-            Some(RosterEntry { id: f[0].parse().ok()?, name: f[1].to_string(), team: f[2].parse().ok()? })
+            let kind = f.get(3).and_then(|k| k.parse().ok()).unwrap_or(0u8);
+            Some(RosterEntry { id: f[0].parse().ok()?, name: f[1].to_string(), team: f[2].parse().ok()?, kind: kind.min(KINDS as u8 - 1) })
         })
         .collect()
 }
@@ -96,7 +98,7 @@ impl Host {
         Ok(Host {
             sock,
             clients: HashMap::new(),
-            roster: vec![RosterEntry { id: 0, name: name.clone(), team: 0 }],
+            roster: vec![RosterEntry { id: 0, name: name.clone(), team: 0, kind: 0 }],
             match_type,
             in_game: false,
             host_name: name,
@@ -197,7 +199,11 @@ impl Host {
                 let team = if self.team_count(0) <= self.team_count(1) { 0 } else { 1 };
                 let id = self.next_id;
                 self.next_id += 1;
-                self.roster.push(RosterEntry { id, name: sanitize_name(arg), team });
+                let (nm, kind) = match arg.rsplit_once(':') {
+                    Some((n, k)) if k.parse::<u8>().is_ok() => (n, k.parse::<u8>().unwrap().min(KINDS as u8 - 1)),
+                    _ => (arg, 0),
+                };
+                self.roster.push(RosterEntry { id, name: sanitize_name(nm), team, kind });
                 self.clients.insert(addr, ClientInfo { id, last_seen: Instant::now(), ctrl: Control::default() });
                 self.send(&format!("WELCOME:{id}"), addr);
                 self.last_lobby = Instant::now() - LOBBY_INTERVAL; // push roster right away
@@ -313,6 +319,7 @@ pub struct Client {
     pub host: Option<SocketAddr>,
     pub my_id: Option<u32>,
     name: String,
+    pub kind: u8,
     last_recv: Instant,
     last_input: Instant,
     last_ctrl: Control,
@@ -332,6 +339,7 @@ impl Client {
             host: None,
             my_id: None,
             name: sanitize_name(name),
+            kind: 0,
             last_recv: Instant::now(),
             last_input: ago,
             last_ctrl: Control::default(),
@@ -363,7 +371,7 @@ impl Client {
         if let Some(host) = self.host {
             if self.my_id.is_none() && self.last_join.elapsed() > Duration::from_millis(500) {
                 self.last_join = Instant::now();
-                let _ = self.sock.send_to(format!("JOIN:{}", self.name).as_bytes(), host);
+                let _ = self.sock.send_to(format!("JOIN:{}:{}", self.name, self.kind).as_bytes(), host);
             }
             // Send changes promptly (but at most ~60/s) and a keep-alive at 20 Hz.
             let since = self.last_input.elapsed();
@@ -651,7 +659,7 @@ mod tests {
         assert_eq!(host.match_type, 2);
         // 3 players on team 0 would not fit 1v1 or 2v2... simulate
         for i in 0..3 {
-            host.roster.push(RosterEntry { id: 10 + i, name: "x".into(), team: 0 });
+            host.roster.push(RosterEntry { id: 10 + i, name: "x".into(), team: 0, kind: 0 });
         }
         host.cycle_match_type();
         assert_eq!(host.match_type, 4, "skips 1 (too small)");
@@ -661,7 +669,7 @@ mod tests {
     fn rebalance_evens_teams() {
         let mut host = Host::new(23107, "H", 4).unwrap();
         for i in 1..5 {
-            host.roster.push(RosterEntry { id: i, name: "x".into(), team: 0 });
+            host.roster.push(RosterEntry { id: i, name: "x".into(), team: 0, kind: 0 });
         }
         host.rebalance();
         let a = host.roster.iter().filter(|e| e.team == 0).count();
@@ -711,5 +719,23 @@ mod tests {
         }
         assert_eq!(host.input(id), Control::default());
         assert_eq!(host.roster.len(), 2);
+    }
+
+    #[test]
+    fn tank_kind_travels_through_join_and_lobby() {
+        let mut host = Host::new(23190, "Hos", 2).unwrap();
+        let mut c = Client::new(23190, "Kid").unwrap();
+        c.kind = 2;
+        c.connect(format!("127.0.0.1:{}", 23190).parse().unwrap());
+        for _ in 0..40 {
+            c.poll(Control::default());
+            host.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let e = host.roster.iter().find(|e| e.name == "Kid").expect("joined");
+        assert_eq!(e.kind, 2);
+        let specs = roster_to_specs(&host.roster);
+        assert!(specs.iter().any(|s| s.kind == 2));
+        assert_eq!(decode_roster("1,Old,0")[0].kind, 0, "legacy 3-field roster still parses");
     }
 }
