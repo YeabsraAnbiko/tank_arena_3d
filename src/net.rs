@@ -7,6 +7,7 @@
 //!   host -> client   WELCOME:<id>  REJECT:<reason>
 //!                    HELLO:<host name>:<players>:<capacity>:<match type>:<in game 0|1>
 //!                    LOBBY:<match type>:<id,name,team,kind;...>
+//!   client -> host:  TEAM:<0|1>   (ask to switch side while in the lobby)
 //!                    STATE:...  (see sim::World::encode_state)
 //!
 //! Only std::net is used, so it behaves the same on Linux, Windows, Android.
@@ -208,6 +209,15 @@ impl Host {
                 self.send(&format!("WELCOME:{id}"), addr);
                 self.last_lobby = Instant::now() - LOBBY_INTERVAL; // push roster right away
             }
+            "TEAM" => {
+                if let Some(c) = self.clients.get_mut(&addr) {
+                    c.last_seen = Instant::now();
+                    let id = c.id;
+                    if let Ok(t) = arg.parse::<u8>() {
+                        self.set_team(id, t);
+                    }
+                }
+            }
             "INPUT" => {
                 if let Some(c) = self.clients.get_mut(&addr) {
                     c.last_seen = Instant::now();
@@ -223,6 +233,22 @@ impl Host {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Move a player to `team` if that side still has room (lobby only).
+    pub fn set_team(&mut self, id: u32, team: u8) -> bool {
+        if self.in_game || team > 1 {
+            return false;
+        }
+        let cap = self.match_type as usize;
+        match self.roster.iter().position(|e| e.id == id) {
+            Some(i) if self.roster[i].team != team && self.team_count(team) < cap => {
+                self.roster[i].team = team;
+                self.last_lobby = Instant::now() - LOBBY_INTERVAL; // push the new roster right away
+                true
+            }
+            _ => false,
         }
     }
 
@@ -436,6 +462,13 @@ impl Client {
             }
             "STATE" => Some(ClientMsg::State(msg.to_string())),
             _ => None,
+        }
+    }
+
+    /// Ask the host to move us to `team` (0 = blue, 1 = red).
+    pub fn request_team(&mut self, team: u8) {
+        if let Some(h) = self.host {
+            let _ = self.sock.send_to(format!("TEAM:{team}").as_bytes(), h);
         }
     }
 
@@ -737,5 +770,40 @@ mod tests {
         let specs = roster_to_specs(&host.roster);
         assert!(specs.iter().any(|s| s.kind == 2));
         assert_eq!(decode_roster("1,Old,0")[0].kind, 0, "legacy 3-field roster still parses");
+    }
+
+    #[test]
+    fn players_choose_their_team() {
+        let mut host = Host::new(23191, "Hos", 2).unwrap();
+        host.roster.push(RosterEntry { id: 5, name: "a".into(), team: 1, kind: 0 });
+        host.roster.push(RosterEntry { id: 6, name: "b".into(), team: 1, kind: 0 });
+        // 2v2: red holds two, so the host cannot join it
+        assert!(!host.set_team(0, 1), "red is full");
+        assert!(host.set_team(5, 0), "blue has room");
+        assert_eq!(host.roster.iter().find(|e| e.id == 5).unwrap().team, 0);
+        assert!(!host.set_team(6, 0), "blue is now full");
+        assert!(!host.set_team(5, 0), "already there");
+        assert!(!host.set_team(5, 2), "invalid team");
+        assert!(!host.set_team(99, 0), "unknown player");
+    }
+
+    #[test]
+    fn team_request_travels_over_udp() {
+        let mut host = Host::new(23192, "Hos", 2).unwrap();
+        let mut c = Client::new(23192, "Kid").unwrap();
+        c.connect(format!("127.0.0.1:{}", 23192).parse().unwrap());
+        for _ in 0..40 {
+            c.poll(Control::default());
+            host.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = host.roster.iter().find(|e| e.name == "Kid").unwrap().team;
+        c.request_team(1 - before);
+        for _ in 0..40 {
+            c.poll(Control::default());
+            host.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.roster.iter().find(|e| e.name == "Kid").unwrap().team, 1 - before);
     }
 }

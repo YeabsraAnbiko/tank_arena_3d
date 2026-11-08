@@ -17,6 +17,15 @@ use settings::Settings;
 use sim::*;
 use ui::*;
 
+/// Window / taskbar icon (raw RGBA generated from assets/icon).
+fn window_icon() -> macroquad::miniquad::conf::Icon {
+    macroquad::miniquad::conf::Icon {
+        small: include_bytes!("../assets/icon/16.rgba").to_owned(),
+        medium: include_bytes!("../assets/icon/32.rgba").to_owned(),
+        big: include_bytes!("../assets/icon/64.rgba").to_owned(),
+    }
+}
+
 fn conf() -> Conf {
     Conf {
         window_title: "Tank Arena 3D".to_string(),
@@ -24,6 +33,7 @@ fn conf() -> Conf {
         window_height: 720,
         high_dpi: true,
         sample_count: 4,
+        icon: Some(window_icon()),
         ..Default::default()
     }
 }
@@ -96,6 +106,9 @@ struct App {
 struct TouchCtl {
     stick: Option<(u64, Vec2)>,
     look: Option<(u64, Vec2)>,
+    /// where the aim stick was first touched, and its current offset
+    look_origin: Vec2,
+    look_knob: Vec2,
     knob: Vec2,
     /// (fire, boost, reload) buttons currently held
     flags: (bool, bool, bool),
@@ -205,7 +218,6 @@ impl App {
             if !h.can_start() {
                 return;
             }
-            h.rebalance();
             h.in_game = true;
             let specs = roster_to_specs(&h.roster);
             let w = World::new_match(&specs, (get_time() * 1000.0) as u64 + 7);
@@ -501,7 +513,7 @@ fn run_menus(app: &mut App) {
         }
         Screen::Settings => {
             app.ui.title("SETTINGS", 64.0);
-            app.ui.panel(300.0, 110.0, 680.0, 520.0);
+            app.ui.panel(300.0, 110.0, 680.0, 560.0);
             // name
             app.ui.text("Name", 340.0, 168.0, 26.0, DIM, Align::Left);
             let name = app.settings.name.clone();
@@ -552,7 +564,12 @@ fn run_menus(app: &mut App) {
                 app.settings.sens = (((sv * 10.0).round() + 1.0) / 10.0).min(3.0);
             }
             app.ui.text(&format!("{:.1}x", sv), 750.0, 474.0, 28.0, TEXT, Align::Center);
-            if app.ui.button(cx - 150.0, 548.0, 300.0, 56.0, "BACK", Style::Primary) {
+            app.ui.text("Touch aim", 340.0, 550.0, 26.0, DIM, Align::Left);
+            let aim_label = if app.settings.aim_stick { "RIGHT STICK" } else { "DRAG RIGHT SIDE" };
+            if app.ui.button(560.0, 520.0, 380.0, 60.0, aim_label, Style::Normal) {
+                app.settings.aim_stick = !app.settings.aim_stick;
+            }
+            if app.ui.button(cx - 150.0, 600.0, 300.0, 56.0, "BACK", Style::Primary) {
                 app.settings.save();
                 app.screen = Screen::Menu;
                 return;
@@ -567,7 +584,7 @@ fn run_menus(app: &mut App) {
                         ("MAP VIEW".into(), "Tap anywhere to fire (your spin reverses). Hold to drive, release to spin again.".into()),
                         ("CHASE".into(), "W A S D or arrows move the tank the way you press, relative to the camera. Mouse or Q E aims. Click or Space fires.".into()),
                         ("MORE".into(), "Shift boosts, R reloads, C switches view, Esc pauses, M music, F fullscreen.".into()),
-                        ("TOUCH".into(), "Left stick drives, drag the right side to aim, hold FIRE. BOOST and R are buttons.".into()),
+                        ("TOUCH".into(), "Left stick drives, drag the right side to aim (or switch to a right aim stick in Settings), hold FIRE. BOOST and R are buttons.".into()),
                     ],
                 ),
                 (
@@ -824,7 +841,12 @@ fn run_menus(app: &mut App) {
                 _ => (Vec::new(), 2, false),
             };
             app.ui.text(&format!("Your IP: {}", ip), cx, 128.0, 24.0, DIM, Align::Center);
-            draw_roster(&app.ui, &roster, mt);
+            draw_roster(&app.ui, &roster, mt, 0);
+            if let Some(t) = team_tap(&app.ui, &roster, mt, 0) {
+                if let Mode::Host(h) = &mut app.mode {
+                    h.set_team(0, t);
+                }
+            }
             let mode_label = format!("MODE: {}v{}", mt, mt);
             if app.ui.button(cx - 360.0, 585.0, 230.0, 60.0, &mode_label, Style::Normal) {
                 if let Mode::Host(h) = &mut app.mode {
@@ -887,7 +909,16 @@ fn run_menus(app: &mut App) {
                 app.begin_match(w, id);
                 return;
             }
-            draw_roster(&app.ui, &app.roster, app.lobby_match_type);
+            draw_roster(&app.ui, &app.roster, app.lobby_match_type, app.my_id);
+            if let Some(t) = team_tap(&app.ui, &app.roster, app.lobby_match_type, app.my_id) {
+                if let Mode::Client(c) = &mut app.mode {
+                    c.request_team(t);
+                }
+                let me = app.my_id;
+                if let Some(e) = app.roster.iter_mut().find(|e| e.id == me) {
+                    e.team = t; // shows instantly; the host's roster confirms it
+                }
+            }
             app.ui.text("Waiting for the host to start...", cx, 560.0, 24.0, ACCENT, Align::Center);
             if app.ui.button(cx - 150.0, 595.0, 300.0, 56.0, "LEAVE", Style::Danger) {
                 app.leave_to_menu();
@@ -904,17 +935,47 @@ fn run_menus(app: &mut App) {
     }
 }
 
-fn draw_roster(ui: &Ui, roster: &[RosterEntry], mt: u8) {
+fn draw_roster(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) {
     ui.text(&format!("{}v{} match   {}/{} players", mt, mt, roster.len(), capacity(mt)), VW / 2.0, 160.0, 24.0, TEXT, Align::Center);
+    let my_team = roster.iter().find(|e| e.id == me).map(|e| e.team);
     for team in 0..2u8 {
         let x = 200.0 + team as f32 * 460.0;
-        ui.panel(x, 190.0, 420.0, 350.0);
+        let count = roster.iter().filter(|e| e.team == team).count();
         let (name, col) = if team == 0 { ("BLUE TEAM", TEAM_BLUE) } else { ("RED TEAM", TEAM_RED) };
+        ui.panel(x, 190.0, 420.0, 350.0);
+        if my_team == Some(team) {
+            let r = ui.r(x, 190.0, 420.0, 350.0);
+            draw_rectangle_lines(r.x, r.y, r.w, r.h, 5.0 * ui.u, col);
+        }
         ui.text(name, x + 210.0, 220.0, 28.0, col, Align::Center);
         for (i, e) in roster.iter().filter(|e| e.team == team).enumerate() {
-            ui.text(&e.name, x + 40.0, 275.0 + i as f32 * 46.0, 26.0, TEXT, Align::Left);
+            let you = if e.id == me { " (you)" } else { "" };
+            ui.text_fit(&format!("{}{} [{}]", e.name, you, stats(e.kind).name), x + 30.0, 275.0 + i as f32 * 46.0, 24.0, TEXT, Align::Left, 370.0);
+        }
+        let foot = if my_team == Some(team) {
+            "YOUR TEAM"
+        } else if count >= mt as usize {
+            "FULL"
+        } else {
+            "TAP HERE TO JOIN"
+        };
+        ui.text(foot, x + 210.0, 512.0, 22.0, if my_team == Some(team) { col } else { ACCENT }, Align::Center);
+    }
+}
+
+/// A tap (or click) on a team panel that this player can move to.
+fn team_tap(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) -> Option<u8> {
+    let click = ui.click?;
+    let my_team = roster.iter().find(|e| e.id == me).map(|e| e.team);
+    for team in 0..2u8 {
+        let x = 200.0 + team as f32 * 460.0;
+        let r = ui.r(x, 190.0, 420.0, 350.0);
+        let count = roster.iter().filter(|e| e.team == team).count();
+        if r.contains(click) && my_team != Some(team) && count < mt as usize {
+            return Some(team);
         }
     }
+    None
 }
 
 // ------------------------------------------------------------------- play ----
@@ -1045,7 +1106,16 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
         }
         if let Some((id, last)) = app.touch.look {
             if id == t.id {
-                app.aim += (v.x - last.x) * 0.006 * sens;
+                if app.settings.aim_stick {
+                    // right stick: sideways deflection turns the camera/turret at a steady rate
+                    let d = v - app.touch.look_origin;
+                    app.touch.look_knob = d;
+                    let m = (d.x / STICK_R).clamp(-1.0, 1.0);
+                    let m = if m.abs() < 0.12 { 0.0 } else { m };
+                    app.aim += m * 2.8 * sens * get_frame_time();
+                } else {
+                    app.aim += (v.x - last.x) * 0.006 * sens;
+                }
                 app.touch.look = Some((id, v));
                 continue;
             }
@@ -1063,8 +1133,13 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
                 stick_delta = Some(Vec2::ZERO);
             } else if v.x >= 560.0 && v.y > 90.0 && app.touch.look.is_none() {
                 app.touch.look = Some((t.id, v));
+                app.touch.look_origin = v;
+                app.touch.look_knob = Vec2::ZERO;
             }
         }
+    }
+    if app.touch.look.is_none() {
+        app.touch.look_knob = Vec2::ZERO;
     }
     app.touch.flags = (fire, boost, reload);
     let (mut steer, mut throttle) = (0.0, 0.0);
@@ -1110,6 +1185,23 @@ fn draw_touch_controls(app: &App) {
     let k = if active { app.touch.knob.clamp_length_max(STICK_R) } else { Vec2::ZERO };
     let (kx, ky) = at(ox + k.x, oy + k.y);
     draw_circle(kx, ky, 38.0 * u, Color::new(1.0, 1.0, 1.0, if active { 0.5 } else { 0.2 }));
+    if app.settings.aim_stick {
+        // right aim stick: base where the thumb landed, or a hint at rest
+        let (ox, oy, active) = match app.touch.look {
+            Some(_) => (app.touch.look_origin.x, app.touch.look_origin.y, true),
+            None => (800.0, 540.0, false),
+        };
+        let (x, y) = at(ox, oy);
+        let tint = Color::new(0.6, 0.85, 1.0, 1.0);
+        draw_circle(x, y, STICK_R * u, Color::new(tint.r, tint.g, tint.b, if active { 0.14 } else { 0.07 }));
+        draw_circle_lines(x, y, STICK_R * u, 3.0 * u, Color::new(tint.r, tint.g, tint.b, if active { 0.6 } else { 0.3 }));
+        let k = if active { app.touch.look_knob.clamp_length_max(STICK_R) } else { Vec2::ZERO };
+        let (kx, ky) = at(ox + k.x, oy + k.y);
+        draw_circle(kx, ky, 38.0 * u, Color::new(tint.r, tint.g, tint.b, if active { 0.5 } else { 0.2 }));
+        if !active {
+            app.ui.text("AIM", ox, oy, 22.0, DIM, Align::Center);
+        }
+    }
 }
 
 fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame: u64) {
@@ -1483,6 +1575,7 @@ fn draw_hud(app: &mut App, me_alive: bool) {
         let hint = match (drive, app.touch_mode) {
             (false, _) => "TAP = FIRE     HOLD = DRIVE",
             (true, false) => "WASD DRIVE  MOUSE AIM  CLICK FIRE  SHIFT BOOST",
+            (true, true) if app.settings.aim_stick => "LEFT STICK DRIVE   RIGHT STICK AIM",
             (true, true) => "LEFT STICK DRIVE   DRAG RIGHT TO AIM",
         };
         ui.text_fit(hint, VW / 2.0, if drive && app.touch_mode { 250.0 } else { 120.0 }, 28.0, Color::new(1.0, 1.0, 1.0, (8.0 - app.play_time).min(1.0)), Align::Center, 1200.0);
