@@ -214,7 +214,18 @@ impl Host {
                     c.last_seen = Instant::now();
                     let id = c.id;
                     if let Ok(t) = arg.parse::<u8>() {
-                        self.set_team(id, t);
+                        self.swap_team(id, t);
+                    }
+                }
+            }
+            "PROFILE" => {
+                if let Some(c) = self.clients.get_mut(&addr) {
+                    c.last_seen = Instant::now();
+                    let id = c.id;
+                    if let Some((n, k)) = arg.rsplit_once(':') {
+                        if let Ok(k) = k.parse::<u8>() {
+                            self.set_profile(id, n, k);
+                        }
                     }
                 }
             }
@@ -249,6 +260,49 @@ impl Host {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Like `set_team`, but when the other side is full the player trades
+    /// places with someone there (the most recent joiner, preferring a client
+    /// over the host) so nobody is stuck on a side they joined by accident.
+    pub fn swap_team(&mut self, id: u32, team: u8) -> bool {
+        if self.in_game || team > 1 {
+            return false;
+        }
+        if self.set_team(id, team) {
+            return true;
+        }
+        let Some(me) = self.roster.iter().position(|e| e.id == id) else { return false };
+        let mine = self.roster[me].team;
+        if mine == team {
+            return false;
+        }
+        let other = self
+            .roster
+            .iter()
+            .rposition(|e| e.team == team && e.id != 0)
+            .or_else(|| self.roster.iter().rposition(|e| e.team == team));
+        match other {
+            Some(o) => {
+                self.roster[o].team = mine;
+                self.roster[me].team = team;
+                self.last_lobby = Instant::now() - LOBBY_INTERVAL;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Change a player's name and tank while in the lobby.
+    pub fn set_profile(&mut self, id: u32, name: &str, kind: u8) {
+        if self.in_game {
+            return;
+        }
+        if let Some(e) = self.roster.iter_mut().find(|e| e.id == id) {
+            e.name = sanitize_name(name);
+            e.kind = kind.min(KINDS as u8 - 1);
+            self.last_lobby = Instant::now() - LOBBY_INTERVAL;
         }
     }
 
@@ -469,6 +523,15 @@ impl Client {
     pub fn request_team(&mut self, team: u8) {
         if let Some(h) = self.host {
             let _ = self.sock.send_to(format!("TEAM:{team}").as_bytes(), h);
+        }
+    }
+
+    /// Tell the host our new name / tank while still in the lobby.
+    pub fn update_profile(&mut self, name: &str, kind: u8) {
+        self.name = sanitize_name(name);
+        self.kind = kind;
+        if let Some(h) = self.host {
+            let _ = self.sock.send_to(format!("PROFILE:{}:{}", self.name, kind).as_bytes(), h);
         }
     }
 
@@ -805,5 +868,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(host.roster.iter().find(|e| e.name == "Kid").unwrap().team, 1 - before);
+    }
+
+    #[test]
+    fn full_team_swaps_and_profile_updates() {
+        let mut host = Host::new(23193, "Hos", 2).unwrap();
+        host.roster.push(RosterEntry { id: 5, name: "a".into(), team: 0, kind: 0 });
+        host.roster.push(RosterEntry { id: 6, name: "b".into(), team: 1, kind: 0 });
+        host.roster.push(RosterEntry { id: 7, name: "c".into(), team: 1, kind: 0 });
+        // blue holds Hos and a, red holds b and c: both full
+        assert!(host.swap_team(5, 1), "full side trades places");
+        let t = |h: &Host, id: u32| h.roster.iter().find(|e| e.id == id).unwrap().team;
+        assert_eq!((t(&host, 5), t(&host, 7)), (1, 0), "the latest joiner on that side moved over");
+        assert!(!host.swap_team(5, 1), "already there");
+        host.set_profile(5, "Newname", 3);
+        let e = host.roster.iter().find(|e| e.id == 5).unwrap();
+        assert_eq!((e.name.as_str(), e.kind), ("Newname", 3));
     }
 }

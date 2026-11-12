@@ -150,6 +150,25 @@ impl App {
         self.notice = Some((s.to_string(), 4.0));
     }
 
+    /// Where Settings/Garage return to: the lobby we came from, or the menu.
+    fn back_target(&self) -> Screen {
+        match self.mode {
+            Mode::Host(_) => Screen::HostLobby,
+            Mode::Client(_) => Screen::ClientLobby,
+            Mode::Offline => Screen::Menu,
+        }
+    }
+
+    /// Push the current name and tank to the lobby so others see changes made there.
+    fn sync_profile(&mut self) {
+        let (name, kind) = (self.settings.name.clone(), self.settings.tank);
+        match &mut self.mode {
+            Mode::Host(h) => h.set_profile(0, &name, kind),
+            Mode::Client(c) => c.update_profile(&name, kind),
+            Mode::Offline => {}
+        }
+    }
+
     fn leave_to_menu(&mut self) {
         match &mut self.mode {
             Mode::Host(h) => h.shutdown(),
@@ -442,6 +461,51 @@ async fn main() {
     }
 }
 
+/// Keep a joined client talking to the host while it sits in the lobby (or in
+/// Settings/Garage opened from it). Returns true when the screen changed
+/// (kicked, lost the host, or the match began).
+fn client_lobby_poll(app: &mut App) -> bool {
+    let mut left: Option<String> = None;
+    let mut start = false;
+    if let Mode::Client(c) = &mut app.mode {
+        for m in c.poll(Control::default()) {
+            match m {
+                ClientMsg::Lobby { match_type, roster } => {
+                    app.lobby_match_type = match_type;
+                    app.roster = roster;
+                }
+                ClientMsg::Reject(r) => left = Some(r),
+                ClientMsg::State(s) => {
+                    if s.starts_with("STATE:P") {
+                        start = true;
+                        let specs = roster_to_specs(&app.roster);
+                        let mut w = World::new_match(&specs, 0);
+                        w.apply_state(&s);
+                        app.world = w;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if c.host_timed_out() {
+            left = Some("Lost connection to the host".into());
+        }
+        app.my_id = c.my_id.unwrap_or(u32::MAX);
+    }
+    if let Some(r) = left {
+        app.leave_to_menu();
+        app.note(&r);
+        return true;
+    }
+    if start {
+        let w = std::mem::replace(&mut app.world, World::new_match(&[], 1));
+        let id = app.my_id;
+        app.begin_match(w, id);
+        return true;
+    }
+    false
+}
+
 // ------------------------------------------------------------------ menus ----
 
 fn run_menus(app: &mut App) {
@@ -452,6 +516,11 @@ fn run_menus(app: &mut App) {
             h.poll();
             h.send_lobby();
         }
+        Mode::Client(c) if c.my_id.is_some() && matches!(app.screen, Screen::Settings | Screen::Garage | Screen::Keyboard { target: KbTarget::Name, .. }) => {
+            if client_lobby_poll(app) {
+                return;
+            }
+        }
         _ => {}
     }
     if is_key_pressed(KeyCode::Escape) && !matches!(app.screen, Screen::Keyboard { .. }) {
@@ -459,9 +528,14 @@ fn run_menus(app: &mut App) {
             Screen::Menu => app.quit = cfg!(not(target_os = "android")),
             Screen::Settings => {
                 app.settings.save();
-                app.screen = Screen::Menu;
+                app.sync_profile();
+                app.screen = app.back_target();
             }
-            Screen::HowTo | Screen::Garage => {
+            Screen::Garage => {
+                app.sync_profile();
+                app.screen = app.back_target();
+            }
+            Screen::HowTo => {
                 app.help_page = 0;
                 app.screen = Screen::Menu;
             }
@@ -608,7 +682,8 @@ fn run_menus(app: &mut App) {
             }
             if app.ui.button(cx - 150.0, row(next) + 6.0, 300.0, 50.0, "BACK", Style::Primary) {
                 app.settings.save();
-                app.screen = Screen::Menu;
+                app.sync_profile();
+                app.screen = app.back_target();
                 return;
             }
             // save as soon as anything changes, in case the app is closed from Android
@@ -769,7 +844,8 @@ fn run_menus(app: &mut App) {
                 app.settings.save();
             }
             if app.ui.button(60.0, 636.0, 260.0, 54.0, "BACK", Style::Normal) {
-                app.screen = Screen::Menu;
+                app.sync_profile();
+                app.screen = app.back_target();
                 return;
             }
         }
@@ -876,6 +952,14 @@ fn run_menus(app: &mut App) {
         }
         Screen::HostLobby => {
             app.ui.title("HOST GAME", 70.0);
+            if app.ui.button(30.0, 20.0, 220.0, 50.0, "SETTINGS", Style::Normal) {
+                app.screen = Screen::Settings;
+                return;
+            }
+            if app.ui.button(1030.0, 20.0, 220.0, 50.0, "GARAGE", Style::Normal) {
+                app.screen = Screen::Garage;
+                return;
+            }
             let ip = local_ip().unwrap_or_else(|| "?".into());
             let (roster, mt, can_start) = match &app.mode {
                 Mode::Host(h) => (h.roster.clone(), h.match_type, h.can_start()),
@@ -885,7 +969,7 @@ fn run_menus(app: &mut App) {
             draw_roster(&app.ui, &roster, mt, 0);
             if let Some(t) = team_tap(&app.ui, &roster, mt, 0) {
                 if let Mode::Host(h) = &mut app.mode {
-                    h.set_team(0, t);
+                    h.swap_team(0, t);
                 }
             }
             let mode_label = format!("MODE: {}v{}", mt, mt);
@@ -912,42 +996,15 @@ fn run_menus(app: &mut App) {
         }
         Screen::ClientLobby => {
             app.ui.title("LOBBY", 70.0);
-            let mut left: Option<String> = None;
-            let mut start = false;
-            if let Mode::Client(c) = &mut app.mode {
-                for m in c.poll(Control::default()) {
-                    match m {
-                        ClientMsg::Lobby { match_type, roster } => {
-                            app.lobby_match_type = match_type;
-                            app.roster = roster;
-                        }
-                        ClientMsg::Reject(r) => left = Some(r),
-                        ClientMsg::State(s) => {
-                            if s.starts_with("STATE:P") {
-                                start = true;
-                                let specs = roster_to_specs(&app.roster);
-                                let mut w = World::new_match(&specs, 0);
-                                w.apply_state(&s);
-                                app.world = w;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if c.host_timed_out() {
-                    left = Some("Lost connection to the host".into());
-                }
-                app.my_id = c.my_id.unwrap_or(u32::MAX);
-            }
-            if let Some(r) = left {
-                app.leave_to_menu();
-                app.note(&r);
+            if app.ui.button(30.0, 20.0, 220.0, 50.0, "SETTINGS", Style::Normal) {
+                app.screen = Screen::Settings;
                 return;
             }
-            if start {
-                let w = std::mem::replace(&mut app.world, World::new_match(&[], 1));
-                let id = app.my_id;
-                app.begin_match(w, id);
+            if app.ui.button(1030.0, 20.0, 220.0, 50.0, "GARAGE", Style::Normal) {
+                app.screen = Screen::Garage;
+                return;
+            }
+            if client_lobby_poll(app) {
                 return;
             }
             draw_roster(&app.ui, &app.roster, app.lobby_match_type, app.my_id);
@@ -956,8 +1013,11 @@ fn run_menus(app: &mut App) {
                     c.request_team(t);
                 }
                 let me = app.my_id;
-                if let Some(e) = app.roster.iter_mut().find(|e| e.id == me) {
-                    e.team = t; // shows instantly; the host's roster confirms it
+                let room = app.roster.iter().filter(|e| e.team == t).count() < app.lobby_match_type as usize;
+                if room {
+                    if let Some(e) = app.roster.iter_mut().find(|e| e.id == me) {
+                        e.team = t; // shows instantly; the host's roster confirms it
+                    }
                 }
             }
             app.ui.text("Waiting for the host to start...", cx, 560.0, 24.0, ACCENT, Align::Center);
@@ -1011,8 +1071,8 @@ fn team_tap(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) -> Option<u8> {
     for team in 0..2u8 {
         let x = 200.0 + team as f32 * 460.0;
         let r = ui.r(x, 190.0, 420.0, 350.0);
-        let count = roster.iter().filter(|e| e.team == team).count();
-        if r.contains(click) && my_team != Some(team) && count < mt as usize {
+        let _ = mt; // a full side is fine: the host swaps places
+        if r.contains(click) && my_team != Some(team) {
             return Some(team);
         }
     }
