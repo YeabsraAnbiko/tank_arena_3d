@@ -161,6 +161,38 @@ pub fn make_ground_texture() -> Texture2D {
     tex
 }
 
+/// Brick pattern for the arena wall: 4 bricks wide, 3 rows, repeats along the wall.
+pub fn make_brick_texture() -> Texture2D {
+    let (w, h) = (512u32, 96u32);
+    let mut img = Image::gen_image_color(w as u16, h as u16, GRAY);
+    let mortar = Color::new(0.50, 0.46, 0.41, 1.0);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let row = y / 32;
+            let off = if row % 2 == 1 { 64 } else { 0 };
+            let xx = (x + off) % w as i32;
+            let (bx, by) = (xx % 128, y % 32);
+            let id = (xx / 128) + row * 7;
+            let c = if bx < 3 || by < 3 {
+                let k = 0.92 + 0.16 * hash(x, y, 90);
+                Color::new(mortar.r * k, mortar.g * k, mortar.b * k, 1.0)
+            } else {
+                let tone = 0.78 + 0.34 * hash(id, 1, 91);
+                let warm = hash(id, 2, 91);
+                let grain = 0.9 + 0.2 * hash(x, y, 92);
+                // light edge on top, shade underneath
+                let edge = if by < 6 { 1.12 } else if by > 28 { 0.82 } else { 1.0 };
+                let k = tone * grain * edge;
+                Color::new((0.62 + 0.08 * warm) * k, (0.30 + 0.05 * warm) * k, 0.20 * k, 1.0)
+            };
+            img.set_pixel(x as u32, y as u32, c);
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
 /// Seamless grass that is repeated across the field outside the arena.
 pub fn make_outer_texture() -> Texture2D {
     let img = paint_meadow(256, 256, 0.8, true, 50);
@@ -184,21 +216,60 @@ fn shade(c: Color, f: f32) -> Color {
 }
 
 /// Collects lit triangles from many shapes and draws them in a few calls.
+/// Cheap per-run counters for `TA_PROF=1` benchmarking.
+pub static PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROF_VERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Batch {
     v: Vec<Vertex>,
     i: Vec<u16>,
+    /// Reused for every flush so a frame does not allocate.
+    scratch: Mesh,
+    /// When set, finished meshes are collected here instead of being drawn
+    /// (used once at start-up to bake the static scenery).
+    capture: Option<Vec<Mesh>>,
 }
 
 impl Batch {
     pub fn new() -> Batch {
-        Batch { v: Vec::with_capacity(8192), i: Vec::with_capacity(16384) }
+        Batch {
+            v: Vec::with_capacity(8192),
+            i: Vec::with_capacity(16384),
+            scratch: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None },
+            capture: None,
+        }
+    }
+
+    /// A batch that bakes everything into reusable meshes.
+    pub fn capturing() -> Batch {
+        let mut b = Batch::new();
+        b.capture = Some(Vec::new());
+        b
+    }
+
+    /// The baked meshes (capturing batches only).
+    pub fn finish(mut self) -> Vec<Mesh> {
+        self.flush();
+        self.capture.take().unwrap_or_default()
     }
 
     pub fn flush(&mut self) {
         if self.v.is_empty() {
             return;
         }
-        draw_mesh(&Mesh { vertices: std::mem::take(&mut self.v), indices: std::mem::take(&mut self.i), texture: None });
+        PROF_VERTS.fetch_add(self.v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::mem::swap(&mut self.scratch.vertices, &mut self.v);
+        std::mem::swap(&mut self.scratch.indices, &mut self.i);
+        match &mut self.capture {
+            Some(done) => done.push(Mesh { vertices: self.scratch.vertices.clone(), indices: self.scratch.indices.clone(), texture: self.scratch.texture.clone() }),
+            None => draw_mesh(&self.scratch),
+        }
+        self.scratch.vertices.clear();
+        self.scratch.indices.clear();
+        std::mem::swap(&mut self.scratch.vertices, &mut self.v);
+        std::mem::swap(&mut self.scratch.indices, &mut self.i);
     }
 
     /// macroquad silently truncates a single mesh beyond ~10k vertices /
@@ -221,6 +292,12 @@ impl Batch {
 
     /// Box with local +X forward, +Y up, +Z right, oriented by `q`.
     pub fn box_q(&mut self, c: Vec3, size: Vec3, q: Quat, col: Color) {
+        self.box_faces(c, size, q, col, 0b111111);
+    }
+
+    /// Like `box_q` but only emits the faces in `mask` (bit 0 top, 1 bottom,
+    /// 2 front, 3 back, 4 right, 5 left) - hidden faces cost vertices for nothing.
+    pub fn box_faces(&mut self, c: Vec3, size: Vec3, q: Quat, col: Color, mask: u8) {
         let h = size * 0.5;
         let (ax, ay, az) = (q * Vec3::X, q * Vec3::Y, q * Vec3::Z);
         let p = |sx: f32, sy: f32, sz: f32| c + ax * (sx * h.x) + ay * (sy * h.y) + az * (sz * h.z);
@@ -232,9 +309,16 @@ impl Batch {
             (az, [p(1., -1., 1.), p(-1., -1., 1.), p(-1., 1., 1.), p(1., 1., 1.)]),
             (-az, [p(-1., -1., -1.), p(1., -1., -1.), p(1., 1., -1.), p(-1., 1., -1.)]),
         ];
-        for (n, corners) in faces.iter() {
-            self.quad(*corners, shade(col, light(*n)));
+        for (i, (n, corners)) in faces.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                self.quad(*corners, shade(col, light(*n)));
+            }
         }
+    }
+
+    /// One lit quad facing `normal` (flat details such as spokes).
+    pub fn flat_quad(&mut self, p: [Vec3; 4], col: Color, normal: Vec3) {
+        self.quad(p, shade(col, light(normal)));
     }
 
     /// Box rotated only around the vertical axis (`yaw` as in the simulation).
@@ -274,12 +358,16 @@ impl Batch {
 
     /// Upright cylinder (turret base, hatch, exhaust pipe).
     pub fn cyl(&mut self, c: Vec3, r: f32, h: f32, col: Color) {
-        self.disc(c, r, h, Quat::from_rotation_x(FRAC_PI_2), col, shade(col, 0.9), 0.0, 14);
+        self.disc(c, r, h, Quat::from_rotation_x(FRAC_PI_2), col, shade(col, 0.9), 0.0, 10);
     }
 
     /// Smooth-shaded ellipsoid (turret dome, bullets). `sy` squashes it vertically.
     pub fn sphere(&mut self, c: Vec3, r: f32, sy: f32, col: Color) {
-        let (lat, lon) = (6usize, 10usize);
+        self.sphere_n(c, r, sy, col, 6, 10);
+    }
+
+    /// Ellipsoid with an explicit tessellation (low numbers for far-away scenery).
+    pub fn sphere_n(&mut self, c: Vec3, r: f32, sy: f32, col: Color, lat: usize, lon: usize) {
         self.room((lat + 1) * (lon + 1));
         let base = self.v.len() as u16;
         for i in 0..=lat {
@@ -416,49 +504,135 @@ impl TrackAnim {
 
 // ----------------------------------------------------------------- scene ----
 
+/// Everything that never changes, baked once into meshes at start-up so a
+/// frame only has to hand them to the GPU.
+struct Statics {
+    sky: Mesh,
+    outer: Vec<Mesh>,
+    solid: Vec<Mesh>,
+    brick: Vec<Mesh>,
+    /// The obstacle layout the baked meshes were built from.
+    layout: Vec<(f32, f32, f32, f32)>,
+}
+
+struct Tuft {
+    x: f32,
+    y: f32,
+    tone: f32,
+    a0: f32,
+    h: f32,
+}
+
 pub struct Scene {
     pub ground: Texture2D,
     pub outer: Texture2D,
+    brick: Texture2D,
+    batch: std::cell::RefCell<Batch>,
+    statics: Statics,
+    tufts: Vec<Tuft>,
 }
 
 const HAZE: Color = Color::new(0.80, 0.88, 0.92, 1.0);
 const OUTER_HALF: f32 = 96.0;
 const OUTER_TILE: f32 = 8.0;
+const WALL_T: f32 = 0.5;
+const WALL_H: f32 = 0.78;
+/// World length of one repeat of the brick texture (four bricks wide).
+const BRICK_TILE: f32 = 3.8;
 
 impl Scene {
     pub fn new() -> Scene {
-        Scene { ground: make_ground_texture(), outer: make_outer_texture() }
+        let mut sc = Scene {
+            ground: make_ground_texture(),
+            outer: make_outer_texture(),
+            brick: make_brick_texture(),
+            batch: std::cell::RefCell::new(Batch::new()),
+            statics: Statics { sky: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None }, outer: Vec::new(), solid: Vec::new(), brick: Vec::new(), layout: Vec::new() },
+            tufts: Vec::new(),
+        };
+        sc.statics = sc.bake();
+        sc.tufts = sc.make_tufts(&default_obstacles());
+        sc
     }
 
-    pub fn draw_world(&self, world: &World, time: f32, tracks: &TrackAnim, aim: Option<&(Vec<(f32, f32)>, bool)>, hide_pips_of: Option<u32>) {
-        self.draw_sky();
-        self.draw_outer_field();
-        draw_plane(vec3(0.0, 0.0, 0.0), vec2(ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0), Some(&self.ground), WHITE);
-
-        let mut b = Batch::new();
-        self.draw_scenery(&mut b, time);
-        self.draw_grass(&mut b, world, time);
-        self.draw_walls(&mut b);
-        for (i, o) in world.obstacles.iter().enumerate() {
+    /// Builds every static mesh once.
+    fn bake(&self) -> Statics {
+        let obstacles = default_obstacles();
+        let mut b = Batch::capturing();
+        self.scenery_static(&mut b);
+        self.wall_caps(&mut b);
+        for (i, o) in obstacles.iter().enumerate() {
             self.draw_obstacle(&mut b, o, i);
         }
+        Statics {
+            sky: self.sky_mesh(),
+            outer: self.outer_meshes(),
+            solid: b.finish(),
+            brick: self.brick_wall_meshes(),
+            layout: obstacles.iter().map(|o| (o.x, o.y, o.w, o.h)).collect(),
+        }
+    }
+
+    fn make_tufts(&self, obstacles: &[Obstacle]) -> Vec<Tuft> {
+        let mut v = Vec::new();
+        for k in 0..320 {
+            let x = 18.0 + hash(k, 1, 70) * (ARENA_W - 36.0);
+            let y = 18.0 + hash(k, 2, 70) * (ARENA_H - 36.0);
+            if obstacles.iter().any(|o| x > o.x - 14.0 && x < o.x + o.w + 14.0 && y > o.y - 14.0 && y < o.y + o.h + 14.0) {
+                continue;
+            }
+            v.push(Tuft { x, y, tone: 0.85 + 0.3 * hash(k, 3, 70), a0: hash(k, 4, 70) * 6.0, h: 0.16 + 0.12 * hash(k, 5, 70) });
+        }
+        v
+    }
+
+    fn same_layout(&self, world: &World) -> bool {
+        world.obstacles.len() == self.statics.layout.len() && world.obstacles.iter().zip(&self.statics.layout).all(|(o, l)| (o.x, o.y, o.w, o.h) == *l)
+    }
+
+    pub fn draw_world(&self, world: &World, time: f32, tracks: &TrackAnim, aim: Option<&(Vec<(f32, f32)>, bool)>, hide_pips_of: Option<u32>, eye: Vec3) {
+        let t0 = std::time::Instant::now();
+        // opaque things front to back: floor and meadow first, the sky last, so
+        // the GPU can skip the pixels the sky would only overdraw
+        draw_plane(vec3(0.0, 0.0, 0.0), vec2(ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0), Some(&self.ground), WHITE);
+        for m in self.statics.outer.iter().chain(&self.statics.solid).chain(&self.statics.brick) {
+            draw_mesh(m);
+        }
+        PROF_CALLS.fetch_add((self.statics.outer.len() + self.statics.solid.len() + self.statics.brick.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+        for m in self.statics.solid.iter().chain(&self.statics.outer).chain(&self.statics.brick) {
+            PROF_VERTS.fetch_add(m.vertices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let mut b = self.batch.borrow_mut();
+        if !self.same_layout(world) {
+            // a custom layout (tests): draw obstacles the slow way
+            for (i, o) in world.obstacles.iter().enumerate() {
+                self.draw_obstacle(&mut b, o, i);
+            }
+        }
+        self.draw_clouds(&mut b, time);
+        self.draw_grass(&mut b, time);
         for p in &world.pickups {
             self.draw_pickup(&mut b, p, time);
         }
         for t in world.tanks.iter() {
             let k = index_in_team(world, t.id);
-            self.draw_tank(&mut b, t, k, time, tracks.get(t.id), hide_pips_of != Some(t.id));
+            // distant tanks are tiny on screen: skip the fine details
+            let hi = (eye - w3(t.x, t.y, 0.0)).length() < 16.0;
+            self.draw_tank(&mut b, t, k, time, tracks.get(t.id), hide_pips_of != Some(t.id), hi);
         }
         for bl in &world.bullets {
             let pos = w3(bl.x, bl.y, 0.6);
-            b.sphere(pos, 0.11, 1.0, Color::new(1.0, 0.85, 0.3, 1.0));
+            b.sphere_n(pos, 0.11, 1.0, Color::new(1.0, 0.85, 0.3, 1.0), 4, 6);
             let back = vec3(-bl.vx, 0.0, -bl.vy).normalize_or_zero() * 0.28;
-            b.sphere(pos + back, 0.07, 1.0, Color::new(1.0, 0.6, 0.2, 1.0));
+            b.sphere_n(pos + back, 0.07, 1.0, Color::new(1.0, 0.6, 0.2, 1.0), 4, 6);
         }
         if let Some((pts, hit)) = aim {
             self.draw_aim_line(&mut b, pts, *hit);
         }
         b.flush();
+        drop(b);
+        draw_mesh(&self.statics.sky);
 
         // translucent things last
         for p in &world.pickups {
@@ -469,6 +643,7 @@ impl Scene {
             let pulse = 0.22 + 0.08 * (time * 8.0).sin();
             draw_sphere(w3(t.x, t.y, 0.4), 0.78, None, Color::new(0.35, 0.75, 1.0, pulse));
         }
+        PROF_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Dotted trajectory of the next shot, fading with each bounce, ending in
@@ -493,39 +668,54 @@ impl Scene {
         }
     }
 
-    /// Brick wall around the arena: staggered bricks over dark mortar, stone cap.
-    fn draw_walls(&self, b: &mut Batch) {
+    /// Stone cap and corner posts of the arena wall (the brick faces are textured quads).
+    fn wall_caps(&self, b: &mut Batch) {
         let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
-        let t = 0.5;
-        let (rows, rh) = (3, 0.26);
-        let mortar = Color::new(0.24, 0.19, 0.15, 1.0);
+        let t = WALL_T;
         let cap = Color::new(0.58, 0.56, 0.52, 1.0);
-        // (centre x, centre z, length, along_x)
         let sides = [(0.0, -hh - t / 2.0, hw * 2.0 + t * 2.0, true), (0.0, hh + t / 2.0, hw * 2.0 + t * 2.0, true), (-hw - t / 2.0, 0.0, hh * 2.0, false), (hw + t / 2.0, 0.0, hh * 2.0, false)];
-        for (si, &(cx, cz, len, along_x)) in sides.iter().enumerate() {
-            let dims = |l: f32, th: f32| if along_x { vec3(l, rh, th) } else { vec3(th, rh, l) };
-            // mortar core
-            b.box_y(vec3(cx, rows as f32 * rh / 2.0 - 0.02, cz), dims(len, t - 0.06) * vec3(1.0, rows as f32, 1.0), 0.0, mortar);
-            let n = (len / 0.95).round() as i32;
-            let cell = len / n as f32;
-            for r in 0..rows {
-                let off = if r % 2 == 1 { cell / 2.0 } else { 0.0 };
-                let count = if r % 2 == 1 { n - 1 } else { n };
-                for i in 0..count {
-                    let pos = -len / 2.0 + cell * (i as f32 + 0.5) + off;
-                    let k = 0.82 + 0.3 * hash(i + si as i32 * 97, r, 31);
-                    let tint = hash(i, r + si as i32 * 13, 32);
-                    let col = Color::new((0.60 + 0.08 * tint) * k, (0.36 + 0.04 * tint) * k, 0.25 * k, 1.0);
-                    let (px, pz) = if along_x { (cx + pos, cz) } else { (cx, cz + pos) };
-                    b.box_y(vec3(px, rh * (r as f32 + 0.5) - 0.02, pz), dims(cell - 0.05, t + 0.02) * vec3(1.0, 0.9, 1.0), 0.0, col);
-                }
-            }
-            b.box_y(vec3(cx, rows as f32 * rh + 0.04, cz), dims(len + if along_x { 0.0 } else { 0.0 }, t + 0.14) * vec3(1.0, 0.7, 1.0), 0.0, cap);
+        for &(cx, cz, len, along_x) in sides.iter() {
+            let dims = if along_x { vec3(len, 0.07, t + 0.14) } else { vec3(t + 0.14, 0.07, len) };
+            b.box_faces(vec3(cx, WALL_H + 0.035, cz), dims, Quat::IDENTITY, cap, 0b000001 | 0b111100);
+        }
+        for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            b.box_q(vec3(sx * (hw + t / 2.0), WALL_H / 2.0 + 0.06, sz * (hh + t / 2.0)), vec3(t + 0.2, WALL_H + 0.12, t + 0.2), Quat::IDENTITY, cap);
         }
     }
 
+    /// The brick faces of the wall: a few textured quads instead of hundreds of boxes.
+    fn brick_wall_meshes(&self) -> Vec<Mesh> {
+        let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
+        let t = WALL_T;
+        let mut verts: Vec<Vertex> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        // (centre x, centre z, length, along_x)
+        let sides = [(0.0f32, -hh - t / 2.0, hw * 2.0 + t * 2.0, true), (0.0, hh + t / 2.0, hw * 2.0 + t * 2.0, true), (-hw - t / 2.0, 0.0, hh * 2.0, false), (hw + t / 2.0, 0.0, hh * 2.0, false)];
+        for &(cx, cz, len, along_x) in sides.iter() {
+            let (d, n) = if along_x { (Vec3::X, Vec3::Z) } else { (Vec3::Z, Vec3::X) };
+            for sign in [-1.0f32, 1.0] {
+                let normal = n * sign;
+                let tint = shade(WHITE, light(normal));
+                let mut s0 = -len / 2.0;
+                while s0 < len / 2.0 - 1e-4 {
+                    let s1 = (s0 + BRICK_TILE).min(len / 2.0);
+                    let u1 = (s1 - s0) / BRICK_TILE;
+                    let c = vec3(cx, 0.0, cz) + normal * (t / 2.0);
+                    let (p0, p1) = (c + d * s0, c + d * s1);
+                    let base = verts.len() as u16;
+                    for (pt, uv) in [(p0, vec2(0.0, 1.0)), (p1, vec2(u1, 1.0)), (p1 + Vec3::Y * WALL_H, vec2(u1, 0.0)), (p0 + Vec3::Y * WALL_H, vec2(0.0, 0.0))] {
+                        verts.push(Vertex::new2(pt, uv, tint));
+                    }
+                    idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                    s0 = s1;
+                }
+            }
+        }
+        vec![Mesh { vertices: verts, indices: idx, texture: Some(self.brick.clone()) }]
+    }
+
     /// Gradient sky dome with a warm glow around the sun.
-    fn draw_sky(&self) {
+    fn sky_mesh(&self) -> Mesh {
         let sun = vec3(-0.35, 0.8, 0.5).normalize();
         let zenith = Color::new(0.20, 0.42, 0.78, 1.0);
         let elev = [-0.35f32, 0.0, 0.06, 0.16, 0.32, 0.55, 0.85, 1.15, 1.45, FRAC_PI_2];
@@ -551,52 +741,56 @@ impl Scene {
                 idx.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
             }
         }
-        draw_mesh(&Mesh { vertices: v, indices: idx, texture: None });
+        Mesh { vertices: v, indices: idx, texture: None }
     }
 
     /// Endless-looking meadow around the arena: a repeated seamless texture
     /// that fades into the haze at the horizon.
-    fn draw_outer_field(&self) {
+    fn outer_meshes(&self) -> Vec<Mesh> {
+        let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
         let n = (OUTER_HALF * 2.0 / OUTER_TILE) as i32;
         let fog = |x: f32, z: f32| {
             let d = x.hypot(z);
             let t = ((d - 26.0) / (OUTER_HALF - 26.0)).clamp(0.0, 1.0);
-            let c = mix(WHITE, Color::new(0.74, 0.86, 0.92, 1.0), t * t);
-            c
+            mix(WHITE, Color::new(0.74, 0.86, 0.92, 1.0), t * t)
         };
         let mut v = Vec::with_capacity((n * n * 4) as usize);
-        let mut idx = Vec::with_capacity((n * n * 6) as usize);
         for iz in 0..n {
             for ix in 0..n {
                 let (x0, z0) = (-OUTER_HALF + ix as f32 * OUTER_TILE, -OUTER_HALF + iz as f32 * OUTER_TILE);
-                let base = v.len() as u16;
+                // tiles hidden under the arena floor are never drawn
+                if x0 >= -hw && x0 + OUTER_TILE <= hw && z0 >= -hh && z0 + OUTER_TILE <= hh {
+                    continue;
+                }
                 for (dx, dz, u, w) in [(0.0, 0.0, 0.0, 0.0), (1.0, 0.0, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0), (0.0, 1.0, 0.0, 1.0)] {
                     let (x, z) = (x0 + dx * OUTER_TILE, z0 + dz * OUTER_TILE);
                     v.push(Vertex::new2(vec3(x, -0.04, z), vec2(u, w), fog(x, z)));
                 }
-                idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
         }
         // stay under macroquad's per-mesh limits
         let per = 200usize;
-        for chunk in 0..(v.len() / 4 + per - 1) / per {
-            let (a, e) = (chunk * per, ((chunk + 1) * per).min(v.len() / 4));
-            let verts = v[a * 4..e * 4].to_vec();
-            let ind: Vec<u16> = (0..(e - a) as u16).flat_map(|q| [q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3]).collect();
-            draw_mesh(&Mesh { vertices: verts, indices: ind, texture: Some(self.outer.clone()) });
-        }
+        let quads = v.len() / 4;
+        (0..(quads + per - 1) / per)
+            .map(|chunk| {
+                let (a, e) = (chunk * per, ((chunk + 1) * per).min(quads));
+                let verts = v[a * 4..e * 4].to_vec();
+                let ind: Vec<u16> = (0..(e - a) as u16).flat_map(|q| [q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3]).collect();
+                Mesh { vertices: verts, indices: ind, texture: Some(self.outer.clone()) }
+            })
+            .collect()
     }
 
     /// Hills on the horizon, trees, bushes, boulders and drifting clouds.
-    fn draw_scenery(&self, b: &mut Batch, time: f32) {
+    fn scenery_static(&self, b: &mut Batch) {
         // hills hide the edge of the meadow
-        for k in 0..30 {
-            let a = TAU * (k as f32 + 0.4 * hash(k, 1, 60)) / 30.0;
+        for k in 0..22 {
+            let a = TAU * (k as f32 + 0.4 * hash(k, 1, 60)) / 22.0;
             let rad = OUTER_HALF + 6.0 + 22.0 * hash(k, 2, 60);
             let r = 30.0 + 26.0 * hash(k, 3, 60);
             let tone = 0.85 + 0.2 * hash(k, 4, 60);
             let col = Color::new(0.38 * tone, 0.55 * tone, 0.42 * tone, 1.0);
-            b.sphere(vec3(a.cos() * rad, -r * 0.18, a.sin() * rad), r, 0.42 + 0.2 * hash(k, 5, 60), col);
+            b.sphere_n(vec3(a.cos() * rad, -r * 0.18, a.sin() * rad), r, 0.42 + 0.2 * hash(k, 5, 60), col, 4, 9);
         }
         // trees (rounded and pine-like)
         for k in 0..64 {
@@ -612,11 +806,11 @@ impl Scene {
             if hash(k, 5, 61) > 0.45 {
                 for (i, (dx, dy, dz, rr)) in [(0.0, 2.5, 0.0, 1.25), (0.7, 2.2, 0.3, 0.9), (-0.6, 2.3, -0.4, 0.95)].iter().enumerate() {
                     let g = tone * (0.95 + 0.1 * i as f32);
-                    b.sphere(vec3(x + dx * s, dy * s, z + dz * s), rr * s, 0.85, Color::new(0.14 * g, 0.40 * g, 0.12 * g, 1.0));
+                    b.sphere_n(vec3(x + dx * s, dy * s, z + dz * s), rr * s, 0.85, Color::new(0.14 * g, 0.40 * g, 0.12 * g, 1.0), 4, 7);
                 }
             } else {
                 for (dy, rr) in [(1.7, 1.15), (2.6, 0.9), (3.4, 0.6)] {
-                    b.sphere(vec3(x, dy * s, z), rr * s, 1.25, Color::new(0.08 * tone, 0.30 * tone, 0.16 * tone, 1.0));
+                    b.sphere_n(vec3(x, dy * s, z), rr * s, 1.25, Color::new(0.08 * tone, 0.30 * tone, 0.16 * tone, 1.0), 4, 7);
                 }
             }
         }
@@ -631,15 +825,18 @@ impl Scene {
             if hash(k, 4, 62) > 0.35 {
                 let g = 0.8 + 0.4 * hash(k, 5, 62);
                 b.shadow(vec3(x + 0.2, 0.01, z + 0.2), 0.9 * s, 0.8 * s, 0.0);
-                b.sphere(vec3(x, 0.35 * s, z), 0.8 * s, 0.7, Color::new(0.16 * g, 0.38 * g, 0.12 * g, 1.0));
-                b.sphere(vec3(x + 0.5 * s, 0.28 * s, z + 0.2 * s), 0.55 * s, 0.7, Color::new(0.2 * g, 0.44 * g, 0.14 * g, 1.0));
+                b.sphere_n(vec3(x, 0.35 * s, z), 0.8 * s, 0.7, Color::new(0.16 * g, 0.38 * g, 0.12 * g, 1.0), 4, 7);
+                b.sphere_n(vec3(x + 0.5 * s, 0.28 * s, z + 0.2 * s), 0.55 * s, 0.7, Color::new(0.2 * g, 0.44 * g, 0.14 * g, 1.0), 4, 7);
             } else {
                 let g = 0.8 + 0.3 * hash(k, 5, 62);
                 b.box_y(vec3(x, 0.25 * s, z), vec3(1.1 * s, 0.5 * s, 0.8 * s), hash(k, 6, 62) * 3.0, Color::new(0.5 * g, 0.5 * g, 0.52 * g, 1.0));
             }
         }
-        // clouds
-        for k in 0..14 {
+    }
+
+    /// Slowly drifting clouds (the only moving scenery).
+    fn draw_clouds(&self, b: &mut Batch, time: f32) {
+        for k in 0..9 {
             let a = TAU * hash(k, 1, 63);
             let rad = 120.0 + 200.0 * hash(k, 2, 63);
             let drift = time * (0.5 + 0.5 * hash(k, 3, 63));
@@ -647,31 +844,24 @@ impl Scene {
             let cx = (cx + 330.0).rem_euclid(660.0) - 330.0;
             let h = 70.0 + 50.0 * hash(k, 4, 63);
             let r = 16.0 + 14.0 * hash(k, 5, 63);
-            for (dx, dz, f) in [(0.0, 0.0, 1.0), (r * 0.9, r * 0.2, 0.7), (-r * 0.8, -r * 0.1, 0.75)] {
-                b.sphere(vec3(cx + dx, h, cz + dz), r * f, 0.28, Color::new(1.0, 1.0, 1.0, 1.0));
+            for (dx, dz, f) in [(0.0, 0.0, 1.0), (r * 0.9, r * 0.2, 0.7)] {
+                b.sphere_n(vec3(cx + dx, h, cz + dz), r * f, 0.28, Color::new(1.0, 1.0, 1.0, 1.0), 4, 8);
             }
         }
     }
 
     /// Swaying tufts of grass scattered over the arena floor.
-    fn draw_grass(&self, b: &mut Batch, world: &World, time: f32) {
+    fn draw_grass(&self, b: &mut Batch, time: f32) {
         let base = Color::new(0.10, 0.27, 0.07, 1.0);
-        for k in 0..420 {
-            let x = 18.0 + hash(k, 1, 70) * (ARENA_W - 36.0);
-            let y = 18.0 + hash(k, 2, 70) * (ARENA_H - 36.0);
-            if world.obstacles.iter().any(|o| x > o.x - 14.0 && x < o.x + o.w + 14.0 && y > o.y - 14.0 && y < o.y + o.h + 14.0) {
-                continue;
-            }
-            let p = w3(x, y, 0.0);
-            let sway = (time * 1.6 + x * 0.05 + y * 0.03).sin() * 0.05;
-            let tone = 0.85 + 0.3 * hash(k, 3, 70);
-            let tip = Color::new(0.42 * tone, 0.64 * tone, 0.20 * tone, 1.0);
-            for bl in 0..4 {
-                let a = bl as f32 * 1.57 + hash(k, 4, 70) * 6.0;
+        for tf in &self.tufts {
+            let p = w3(tf.x, tf.y, 0.0);
+            let sway = (time * 1.6 + tf.x * 0.05 + tf.y * 0.03).sin() * 0.05;
+            let tip = Color::new(0.42 * tf.tone, 0.64 * tf.tone, 0.20 * tf.tone, 1.0);
+            for bl in 0..2 {
+                let a = tf.a0 + bl as f32 * 2.1;
                 let (dx, dz) = (a.cos() * 0.05, a.sin() * 0.05);
-                let hgt = 0.16 + 0.12 * hash(k, 5 + bl, 70);
-                let lean = vec3(a.cos() * 0.07 + sway, hgt, a.sin() * 0.07);
-                let side = vec3(-a.sin() * 0.025, 0.0, a.cos() * 0.025);
+                let lean = vec3(a.cos() * 0.07 + sway, tf.h * (1.0 - 0.2 * bl as f32), a.sin() * 0.07);
+                let side = vec3(-a.sin() * 0.03, 0.0, a.cos() * 0.03);
                 b.tri([p + vec3(dx, 0.0, dz) - side, p + vec3(dx, 0.0, dz) + side, p + lean], [base, base, tip]);
             }
         }
@@ -741,9 +931,9 @@ impl Scene {
                 let g = 0.85 + 0.3 * hash(idx as i32, 3, 24);
                 b.shadow(vec3(c.x + 0.3, 0.01, c.z + 0.25), 0.8, 0.65, 0.0);
                 b.box_y(vec3(c.x, 0.5, c.z), vec3(0.3, 1.0, 0.3), 0.0, Color::new(0.38, 0.26, 0.16, 1.0));
-                b.sphere(vec3(c.x, 1.45, c.z), 0.95, 0.9, Color::new(0.14 * g, 0.4 * g, 0.12 * g, 1.0));
-                b.sphere(vec3(c.x + 0.4, 1.2, c.z + 0.15), 0.65, 0.9, Color::new(0.18 * g, 0.46 * g, 0.14 * g, 1.0));
-                b.sphere(vec3(c.x - 0.35, 1.25, c.z - 0.2), 0.6, 0.9, Color::new(0.12 * g, 0.36 * g, 0.1 * g, 1.0));
+                b.sphere_n(vec3(c.x, 1.45, c.z), 0.95, 0.9, Color::new(0.14 * g, 0.4 * g, 0.12 * g, 1.0), 4, 7);
+                b.sphere_n(vec3(c.x + 0.4, 1.2, c.z + 0.15), 0.65, 0.9, Color::new(0.18 * g, 0.46 * g, 0.14 * g, 1.0), 4, 7);
+                b.sphere_n(vec3(c.x - 0.35, 1.25, c.z - 0.2), 0.6, 0.9, Color::new(0.12 * g, 0.36 * g, 0.1 * g, 1.0), 4, 7);
             }
             ObstacleKind::Block => {
                 let c = w3(cx, cy, 0.0);
@@ -809,7 +999,7 @@ impl Scene {
     /// A chunky cartoon tank: rolling tracks on real wheels, sloped hull,
     /// fenders, dome turret with a muzzle-braked cannon, headlights,
     /// exhaust, and a waving team flag on the antenna.
-    pub fn draw_tank(&self, b: &mut Batch, t: &Tank, k: usize, time: f32, tr: (f32, f32), pips: bool) {
+    pub fn draw_tank(&self, b: &mut Batch, t: &Tank, k: usize, time: f32, tr: (f32, f32), pips: bool, hi: bool) {
         // model scale per class; collision radius stays 0.45
         let S: f32 = match t.kind { 1 => 0.96, 2 => 1.2, _ => 1.1 };
         let q = Quat::from_rotation_y(-t.angle);
@@ -839,7 +1029,7 @@ impl Scene {
         let (half_len, wheel_r, belt_r) = (0.33f32, 0.15f32, 0.18f32);
         let straight = half_len * 2.0;
         let perim = 2.0 * straight + TAU * belt_r;
-        let segs = 26usize;
+        let segs = if hi { 26usize } else { 14 };
         for (side, phase) in [(-1.0f32, tr.0), (1.0f32, tr.1)] {
             let z = side * TRACK_HALF_GAP;
             let spin = -phase / wheel_r; // forward travel rolls the wheel clockwise
@@ -859,23 +1049,35 @@ impl Scene {
                 };
                 let col = if j % 2 == 0 { belt_a } else { belt_b };
                 let seg_len = perim / segs as f32 * 0.86;
-                b.box_q(at(vec3(px, py, z)), sz(vec3(seg_len, 0.04, 0.2)), q * Quat::from_rotation_z(pitch), col);
+                // only the outer faces and the visible side of each link
+                let side_bit = if side > 0.0 { 1u8 << 4 } else { 1u8 << 5 };
+                b.box_faces(at(vec3(px, py, z)), sz(vec3(seg_len, 0.04, 0.2)), q * Quat::from_rotation_z(pitch), col, 0b000011 | side_bit);
             }
             // drive wheels (front/back) and small road wheels in between
             let mut wheels: Vec<(f32, f32, f32)> = vec![(half_len, belt_r, wheel_r), (-half_len, belt_r, wheel_r)];
-            for x in [-0.165f32, 0.0, 0.165] {
-                wheels.push((x, 0.105, 0.095));
+            if hi {
+                for x in [-0.165f32, 0.0, 0.165] {
+                    wheels.push((x, 0.105, 0.095));
+                }
             }
             for (wx, wy, r) in wheels {
                 let ang = -phase / r;
                 let wq = q * Quat::from_rotation_z(0.0);
-                b.disc(at(vec3(wx, wy, z)), r * S, 0.17 * S, wq, Color::new(0.1, 0.1, 0.11, 1.0), Color::new(0.2, 0.2, 0.21, 1.0), ang, 10);
-                // outer hub plate with three spokes that turn with the wheel
+                b.disc(at(vec3(wx, wy, z)), r * S, 0.17 * S, wq, Color::new(0.1, 0.1, 0.11, 1.0), Color::new(0.2, 0.2, 0.21, 1.0), ang, if hi { 10 } else { 8 });
+                if !hi {
+                    continue;
+                }
+                // outer hub plate with three flat spokes that turn with the wheel
                 let hz = z + side * 0.105;
                 b.disc(at(vec3(wx, wy, hz)), r * 0.7 * S, 0.02 * S, wq, Color::new(0.68, 0.69, 0.72, 1.0), Color::new(0.58, 0.59, 0.62, 1.0), ang, 8);
                 for sp in 0..3 {
-                    let sq = q * Quat::from_rotation_z(ang + sp as f32 * PI / 3.0);
-                    b.box_q(at(vec3(wx, wy, hz + side * 0.012)), sz(vec3(r * 1.35, 0.022, 0.016)), sq, Color::new(0.4, 0.41, 0.44, 1.0));
+                    let a = ang + sp as f32 * PI / 3.0;
+                    let (dx, dy) = (a.cos() * r * 0.675, a.sin() * r * 0.675);
+                    let (px, py) = (-a.sin() * 0.011, a.cos() * 0.011);
+                    let c0 = at(vec3(wx, wy, hz + side * 0.012));
+                    let o = |l: Vec3| q * (l * S);
+                    let quad_pts = [c0 + o(vec3(-dx - px, -dy - py, 0.0)), c0 + o(vec3(dx - px, dy - py, 0.0)), c0 + o(vec3(dx + px, dy + py, 0.0)), c0 + o(vec3(-dx + px, -dy + py, 0.0))];
+                    b.flat_quad(quad_pts, Color::new(0.4, 0.41, 0.44, 1.0), q * Vec3::Z * side);
                 }
             }
             let _ = spin;
@@ -898,37 +1100,40 @@ impl Scene {
         for gz in [-0.12f32, -0.04, 0.04, 0.12] {
             b.box_q(at(vec3(-0.39, deck + 0.04, gz)), sz(vec3(0.15, 0.012, 0.025)), q, dark); // louvres
         }
-        // camouflage patches
-        for (cx, cz, w, d, yw) in [(0.0f32, -0.1f32, 0.24f32, 0.16f32, 0.4f32), (0.18, 0.12, 0.2, 0.14, -0.3), (-0.2, 0.08, 0.18, 0.18, 0.7)] {
-            b.box_q(at(vec3(cx, deck + 0.004, cz)), sz(vec3(w, 0.006, d)), q * Quat::from_rotation_y(yw), camo);
-        }
-        // driver hatch and vision slit on the glacis
-        b.cyl(at(vec3(0.33, deck + 0.015, -0.11)), 0.055 * S, 0.03 * S, steel);
-        b.box_q(at(vec3(0.5, deck - 0.1, -0.11)), sz(vec3(0.02, 0.025, 0.09)), q * Quat::from_rotation_z(-0.5), dark);
-        // lights, mudflaps, tow hooks
-        for lz in [-0.17f32, 0.17] {
-            b.box_q(at(vec3(0.51, 0.33, lz)), sz(vec3(0.05, 0.065, 0.08)), q, Color::new(1.0, 0.95, 0.55, 1.0));
-            b.box_q(at(vec3(-0.47, 0.34, lz)), sz(vec3(0.03, 0.05, 0.07)), q, Color::new(0.9, 0.12, 0.1, 1.0));
-            b.box_q(at(vec3(0.5, 0.09, lz * 1.9)), sz(vec3(0.02, 0.1, 0.12)), q, rubber);
-        }
-        for hz in [-0.12f32, 0.12] {
-            b.box_q(at(vec3(0.54, 0.16, hz)), sz(vec3(0.05, 0.03, 0.03)), q, steel);
-        }
-        // exhaust with muffler, jerry cans, tow cable and stowage on the fenders
-        b.cyl(at(vec3(-0.47, 0.46, -0.17)), 0.05 * S, 0.16 * S, steel);
-        b.cyl(at(vec3(-0.47, 0.56, -0.17)), 0.032 * S, 0.06 * S, dark);
-        for (jz, jc) in [(0.15f32, Color::new(0.35, 0.4, 0.2, 1.0)), (0.25, Color::new(0.5, 0.2, 0.15, 1.0))] {
-            b.box_q(at(vec3(-0.42, deck + 0.1, jz - 0.05)), sz(vec3(0.07, 0.12, 0.12)), q, jc);
-        }
-        for sz_ in [-1.0f32, 1.0] {
-            b.box_q(at(vec3(0.0, 0.44, sz_ * 0.3)), sz(vec3(0.74, 0.018, 0.018)), q, Color::new(0.1, 0.09, 0.08, 1.0)); // tow cable
-            b.box_q(at(vec3(-0.18, 0.46, sz_ * 0.36)), sz(vec3(0.22, 0.07, 0.07)), q, shade(body, 0.7)); // fender stowage box
-        }
-        // return rollers above the tracks (the tracks themselves keep animating)
-        for rz in [-1.0f32, 1.0] {
-            for rx in [-0.15f32, 0.15] {
-                b.disc(at(vec3(rx, 0.37, rz * TRACK_HALF_GAP)), 0.035 * S, 0.06 * S, q, steel, shade(steel, 1.2), 0.0, 8);
+        if hi {
+            // camouflage patches
+            for (cx, cz, w, d, yw) in [(0.0f32, -0.1f32, 0.24f32, 0.16f32, 0.4f32), (0.18, 0.12, 0.2, 0.14, -0.3), (-0.2, 0.08, 0.18, 0.18, 0.7)] {
+                b.box_q(at(vec3(cx, deck + 0.004, cz)), sz(vec3(w, 0.006, d)), q * Quat::from_rotation_y(yw), camo);
             }
+            // driver hatch and vision slit on the glacis
+            b.cyl(at(vec3(0.33, deck + 0.015, -0.11)), 0.055 * S, 0.03 * S, steel);
+            b.box_q(at(vec3(0.5, deck - 0.1, -0.11)), sz(vec3(0.02, 0.025, 0.09)), q * Quat::from_rotation_z(-0.5), dark);
+            // lights, mudflaps, tow hooks
+            for lz in [-0.17f32, 0.17] {
+                b.box_q(at(vec3(0.51, 0.33, lz)), sz(vec3(0.05, 0.065, 0.08)), q, Color::new(1.0, 0.95, 0.55, 1.0));
+                b.box_q(at(vec3(-0.47, 0.34, lz)), sz(vec3(0.03, 0.05, 0.07)), q, Color::new(0.9, 0.12, 0.1, 1.0));
+                b.box_q(at(vec3(0.5, 0.09, lz * 1.9)), sz(vec3(0.02, 0.1, 0.12)), q, rubber);
+            }
+            for hz in [-0.12f32, 0.12] {
+                b.box_q(at(vec3(0.54, 0.16, hz)), sz(vec3(0.05, 0.03, 0.03)), q, steel);
+            }
+            // exhaust with muffler, jerry cans, tow cable and stowage on the fenders
+            b.cyl(at(vec3(-0.47, 0.46, -0.17)), 0.05 * S, 0.16 * S, steel);
+            b.cyl(at(vec3(-0.47, 0.56, -0.17)), 0.032 * S, 0.06 * S, dark);
+            for (jz, jc) in [(0.15f32, Color::new(0.35, 0.4, 0.2, 1.0)), (0.25, Color::new(0.5, 0.2, 0.15, 1.0))] {
+                b.box_q(at(vec3(-0.42, deck + 0.1, jz - 0.05)), sz(vec3(0.07, 0.12, 0.12)), q, jc);
+            }
+            for sz_ in [-1.0f32, 1.0] {
+                b.box_q(at(vec3(0.0, 0.44, sz_ * 0.3)), sz(vec3(0.74, 0.018, 0.018)), q, Color::new(0.1, 0.09, 0.08, 1.0)); // tow cable
+                b.box_q(at(vec3(-0.18, 0.46, sz_ * 0.36)), sz(vec3(0.22, 0.07, 0.07)), q, shade(body, 0.7)); // fender stowage box
+            }
+            // return rollers above the tracks (the tracks themselves keep animating)
+            for rz in [-1.0f32, 1.0] {
+                for rx in [-0.15f32, 0.15] {
+                    b.disc(at(vec3(rx, 0.37, rz * TRACK_HALF_GAP)), 0.035 * S, 0.06 * S, q, steel, shade(steel, 1.2), 0.0, 8);
+                }
+            }
+
         }
 
         // ---- class-specific armour ----

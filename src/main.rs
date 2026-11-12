@@ -276,6 +276,7 @@ async fn main() {
                 .collect()
         })
         .unwrap_or_default();
+    let prof_start = std::time::Instant::now();
     let exit_after: Option<u64> = std::env::var("TA_EXIT").ok().and_then(|s| s.parse().ok());
     let force_hold: Option<(u64, u64)> = std::env::var("TA_HOLD").ok().and_then(|s| {
         let (a, b) = s.split_once(':')?;
@@ -392,7 +393,7 @@ async fn main() {
             let cam = app.cam.camera(&app.demo, 99, dt);
             set_camera(&cam);
             app.demo_tracks.update(&app.demo);
-            app.scene.draw_world(&app.demo, get_time() as f32, &app.demo_tracks, None, None);
+            app.scene.draw_world(&app.demo, get_time() as f32, &app.demo_tracks, None, None, cam.position);
             set_default_camera();
             draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.03, 0.05, 0.1, 0.62));
             run_menus(&mut app);
@@ -412,6 +413,18 @@ async fn main() {
             }
         }
         if app.quit || exit_after.map_or(false, |n| frame >= n) {
+            if std::env::var("TA_PROF").is_ok() {
+                use std::sync::atomic::Ordering::Relaxed;
+                let f = frame.max(1) as f64;
+                println!(
+                    "PROF frames={} cpu_draw_world={:.3} ms/frame verts={:.0}/frame meshes={:.1}/frame wall_frame={:.2} ms",
+                    frame,
+                    gfx::PROF_NS.load(Relaxed) as f64 / 1e6 / f,
+                    gfx::PROF_VERTS.load(Relaxed) as f64 / f,
+                    gfx::PROF_CALLS.load(Relaxed) as f64 / f,
+                    prof_start.elapsed().as_secs_f64() * 1000.0 / f
+                );
+            }
             if let Mode::Host(h) = &mut app.mode {
                 h.shutdown();
             }
@@ -702,7 +715,7 @@ fn run_menus(app: &mut App) {
             let mut tank = Tank::new(0, 0, "", ARENA_W / 2.0, ARENA_H / 2.0, t * 0.55, false);
             tank.set_kind(sel);
             tank.turret = tank.angle + (t * 0.8).sin() * 0.5;
-            app.scene.draw_tank(&mut b, &tank, 0, t, (t * 0.6, t * 0.6), false);
+            app.scene.draw_tank(&mut b, &tank, 0, t, (t * 0.6, t * 0.6), false, true);
             b.flush();
             set_default_camera();
 
@@ -1432,7 +1445,7 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
     let cam = app.cam.camera(&app.world, my_id, dt);
     set_camera(&cam);
     app.tracks.update(&app.world);
-    app.scene.draw_world(&app.world, app.play_time, &app.tracks, aim_line.as_ref(), if drive { Some(my_id) } else { None });
+    app.scene.draw_world(&app.world, app.play_time, &app.tracks, aim_line.as_ref(), if drive { Some(my_id) } else { None }, cam.position);
     draw_particles(&app.particles);
     set_default_camera();
 
