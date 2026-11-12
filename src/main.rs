@@ -114,6 +114,11 @@ struct TouchCtl {
     flags: (bool, bool, bool),
     /// (drive, reverse) buttons currently held in the aim + drive layout
     drive_flags: (bool, bool),
+    /// time and travel of the current aim touch, for tap-to-fire
+    look_t0: f32,
+    look_moved: f32,
+    boost_grace: f32,
+    tap_pending: bool,
 }
 
 fn demo_world(seed: u64) -> World {
@@ -582,17 +587,26 @@ fn run_menus(app: &mut App) {
                 app.settings.sens = (((sv * 10.0).round() + 1.0) / 10.0).min(3.0);
             }
             app.ui.text(&format!("{:.1}x", sv), 750.0, row(4.0) + 27.0, 28.0, TEXT, Align::Center);
-            app.ui.text("Touch aim", 340.0, row(5.0) + 27.0, 26.0, DIM, Align::Left);
-            let aim_label = if app.settings.aim_stick { "RIGHT STICK" } else { "DRAG RIGHT SIDE" };
-            if app.ui.button(560.0, row(5.0), 380.0, bh, aim_label, Style::Normal) {
-                app.settings.aim_stick = !app.settings.aim_stick;
+            let mut next = 5.0;
+            if app.touch_mode {
+                app.ui.text("Touch aim", 340.0, row(5.0) + 27.0, 26.0, DIM, Align::Left);
+                let aim_label = if app.settings.aim_stick { "RIGHT STICK" } else { "DRAG RIGHT SIDE" };
+                if app.ui.button(560.0, row(5.0), 380.0, bh, aim_label, Style::Normal) {
+                    app.settings.aim_stick = !app.settings.aim_stick;
+                }
+                app.ui.text("Touch move", 340.0, row(6.0) + 27.0, 26.0, DIM, Align::Left);
+                let mv_label = if app.settings.aim_drive { "AIM + DRIVE BUTTON" } else { "LEFT STICK" };
+                if app.ui.button(560.0, row(6.0), 380.0, bh, mv_label, Style::Normal) {
+                    app.settings.aim_drive = !app.settings.aim_drive;
+                }
+                app.ui.text("Tap to fire", 340.0, row(7.0) + 27.0, 26.0, DIM, Align::Left);
+                let tf_label = if app.settings.tap_fire { "ON" } else { "OFF" };
+                if app.ui.button(560.0, row(7.0), 380.0, bh, tf_label, Style::Normal) {
+                    app.settings.tap_fire = !app.settings.tap_fire;
+                }
+                next = 8.0;
             }
-            app.ui.text("Touch move", 340.0, row(6.0) + 27.0, 26.0, DIM, Align::Left);
-            let mv_label = if app.settings.aim_drive { "AIM + DRIVE BUTTON" } else { "LEFT STICK" };
-            if app.ui.button(560.0, row(6.0), 380.0, bh, mv_label, Style::Normal) {
-                app.settings.aim_drive = !app.settings.aim_drive;
-            }
-            if app.ui.button(cx - 150.0, row(7.0) + 6.0, 300.0, 50.0, "BACK", Style::Primary) {
+            if app.ui.button(cx - 150.0, row(next) + 6.0, 300.0, 50.0, "BACK", Style::Primary) {
                 app.settings.save();
                 app.screen = Screen::Menu;
                 return;
@@ -610,7 +624,7 @@ fn run_menus(app: &mut App) {
                     vec![
                         ("MAP VIEW".into(), "Tap anywhere to fire (your spin reverses). Hold to drive, release to spin again.".into()),
                         ("CHASE".into(), "W A S D or arrows move the tank the way you press, relative to the camera. Mouse or Q E aims. Click or Space fires.".into()),
-                        ("MORE".into(), "Shift boosts, R reloads, C switches view, Esc pauses, M music, F fullscreen.".into()),
+                        ("MORE".into(), "Shift (or Ctrl/X) boosts, R reloads, C switches view, Esc pauses, M music, F fullscreen.".into()),
                         ("TOUCH".into(), "Left stick drives, drag the right side to aim, hold FIRE. Settings can switch to a right aim stick, or to AIM + DRIVE: the tank goes where you aim while you hold DRIVE.".into()),
                     ],
                 ),
@@ -1044,7 +1058,11 @@ fn gather_drive(app: &mut App, dt: f32, frame: u64) -> Control {
         (0.0, 0.0)
     };
     c.fire = kd(KeyCode::Space);
-    c.boost = kd(KeyCode::LeftShift) || kd(KeyCode::RightShift);
+    // Shift (either), Ctrl or X boost; a short grace keeps boost alive across the
+    // key-event hiccups some keyboards/platforms produce when arrows and Shift mix.
+    let boost_now = kd(KeyCode::LeftShift) || kd(KeyCode::RightShift) || kd(KeyCode::LeftControl) || kd(KeyCode::RightControl) || kd(KeyCode::X);
+    app.touch.boost_grace = if boost_now { 0.12 } else { (app.touch.boost_grace - dt).max(0.0) };
+    c.boost = boost_now || app.touch.boost_grace > 0.0;
     c.reload = kd(KeyCode::R);
 
     let sens = app.settings.sens;
@@ -1131,10 +1149,16 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
     }
     if let Some((id, _)) = app.touch.look {
         if !live(id) {
+            if app.settings.tap_fire && app.touch.look_moved < 18.0 && get_time() as f32 - app.touch.look_t0 < 0.3 {
+                app.touch.tap_pending = true;
+            }
             app.touch.look = None;
         }
     }
     let (mut fire, mut boost, mut reload) = (false, false, false);
+    if std::mem::take(&mut app.touch.tap_pending) {
+        fire = true;
+    }
     let (mut drive_btn, mut rev_btn) = (false, false);
     let aim_drive = app.settings.aim_drive;
     let mut stick_delta: Option<Vec2> = None;
@@ -1161,6 +1185,7 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
                 } else {
                     app.aim += (v.x - last.x) * 0.006 * sens;
                 }
+                app.touch.look_moved = app.touch.look_moved.max((v - app.touch.look_origin).length());
                 app.touch.look = Some((id, v));
                 continue;
             }
@@ -1183,6 +1208,8 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
             } else if v.x >= 560.0 && v.y > 90.0 && app.touch.look.is_none() {
                 app.touch.look = Some((t.id, v));
                 app.touch.look_origin = v;
+                app.touch.look_t0 = get_time() as f32;
+                app.touch.look_moved = 0.0;
                 app.touch.look_knob = Vec2::ZERO;
             }
         }
@@ -1508,7 +1535,7 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
         if app.ui.button(420.0, 336.0, 440.0, 60.0, "QUIT TO MENU", Style::Danger) {
             quit_pressed = true;
         }
-        let keys = ["WASD / ARROWS  drive", "MOUSE or Q E  aim", "CLICK or SPACE  fire", "SHIFT boost   R reload", "C switch view   ESC pause"];
+        let keys = ["WASD / ARROWS  drive", "MOUSE or Q E  aim", "CLICK or SPACE  fire", "SHIFT/X boost   R reload", "C switch view   ESC pause"];
         for (i, k) in keys.iter().enumerate() {
             app.ui.text_fit(k, VW / 2.0, 435.0 + i as f32 * 30.0, 22.0, DIM, Align::Center, 540.0);
         }
