@@ -112,6 +112,8 @@ struct TouchCtl {
     knob: Vec2,
     /// (fire, boost, reload) buttons currently held
     flags: (bool, bool, bool),
+    /// (drive, reverse) buttons currently held in the aim + drive layout
+    drive_flags: (bool, bool),
 }
 
 fn demo_world(seed: u64) -> World {
@@ -513,29 +515,32 @@ fn run_menus(app: &mut App) {
         }
         Screen::Settings => {
             app.ui.title("SETTINGS", 64.0);
-            app.ui.panel(300.0, 110.0, 680.0, 560.0);
+            app.ui.panel(300.0, 104.0, 680.0, 556.0);
+            let before = app.settings.serialize();
+            let (bh, step) = (54.0, 62.0);
+            let row = |i: f32| 122.0 + i * step;
             // name
-            app.ui.text("Name", 340.0, 168.0, 26.0, DIM, Align::Left);
+            app.ui.text("Name", 340.0, row(0.0) + 27.0, 26.0, DIM, Align::Left);
             let name = app.settings.name.clone();
-            if app.ui.button(560.0, 138.0, 380.0, 60.0, &name, Style::Normal) {
+            if app.ui.button(560.0, row(0.0), 380.0, bh, &name, Style::Normal) {
                 screen = Screen::Keyboard { target: KbTarget::Name, text: String::new() };
                 app.screen = screen;
                 return;
             }
             // volumes
             for (i, label) in ["Music", "Effects"].iter().enumerate() {
-                let y = 218.0 + i as f32 * 76.0;
+                let y = row(1.0 + i as f32);
                 let v = if i == 0 { app.settings.music } else { app.settings.sfx };
-                app.ui.text(label, 340.0, y + 30.0, 26.0, DIM, Align::Left);
+                app.ui.text(label, 340.0, y + 27.0, 26.0, DIM, Align::Left);
                 let mut nv = v;
-                if app.ui.button(560.0, y, 70.0, 60.0, "-", Style::Normal) {
+                if app.ui.button(560.0, y, 70.0, bh, "-", Style::Normal) {
                     nv = ((v * 10.0).round() - 1.0).max(0.0) / 10.0;
                 }
-                if app.ui.button(870.0, y, 70.0, 60.0, "+", Style::Normal) {
+                if app.ui.button(870.0, y, 70.0, bh, "+", Style::Normal) {
                     nv = ((v * 10.0).round() + 1.0).min(10.0) / 10.0;
                 }
-                app.ui.fill(645.0, y + 22.0, 210.0, 16.0, Color::new(0.02, 0.03, 0.06, 1.0));
-                app.ui.fill(645.0, y + 22.0, 210.0 * v, 16.0, ACCENT);
+                app.ui.fill(645.0, y + 19.0, 210.0, 16.0, Color::new(0.02, 0.03, 0.06, 1.0));
+                app.ui.fill(645.0, y + 19.0, 210.0 * v, 16.0, ACCENT);
                 if nv != v {
                     if i == 0 {
                         app.settings.music = nv;
@@ -549,30 +554,39 @@ fn run_menus(app: &mut App) {
                 }
             }
             // start view: MAP = tap/hold controls, CHASE = drive controls
-            app.ui.text("View", 340.0, 398.0, 26.0, DIM, Align::Left);
+            app.ui.text("View", 340.0, row(3.0) + 27.0, 26.0, DIM, Align::Left);
             let cam_label = if app.settings.chase_cam { "CHASE (DRIVE)" } else { "MAP (TAP/HOLD)" };
-            if app.ui.button(560.0, 368.0, 380.0, 60.0, cam_label, Style::Normal) {
+            if app.ui.button(560.0, row(3.0), 380.0, bh, cam_label, Style::Normal) {
                 app.settings.chase_cam = !app.settings.chase_cam;
             }
             // look sensitivity
-            app.ui.text("Aim", 340.0, 474.0, 26.0, DIM, Align::Left);
+            app.ui.text("Aim", 340.0, row(4.0) + 27.0, 26.0, DIM, Align::Left);
             let sv = app.settings.sens;
-            if app.ui.button(560.0, 444.0, 70.0, 60.0, "-", Style::Normal) {
+            if app.ui.button(560.0, row(4.0), 70.0, bh, "-", Style::Normal) {
                 app.settings.sens = (((sv * 10.0).round() - 1.0) / 10.0).max(0.3);
             }
-            if app.ui.button(870.0, 444.0, 70.0, 60.0, "+", Style::Normal) {
+            if app.ui.button(870.0, row(4.0), 70.0, bh, "+", Style::Normal) {
                 app.settings.sens = (((sv * 10.0).round() + 1.0) / 10.0).min(3.0);
             }
-            app.ui.text(&format!("{:.1}x", sv), 750.0, 474.0, 28.0, TEXT, Align::Center);
-            app.ui.text("Touch aim", 340.0, 550.0, 26.0, DIM, Align::Left);
+            app.ui.text(&format!("{:.1}x", sv), 750.0, row(4.0) + 27.0, 28.0, TEXT, Align::Center);
+            app.ui.text("Touch aim", 340.0, row(5.0) + 27.0, 26.0, DIM, Align::Left);
             let aim_label = if app.settings.aim_stick { "RIGHT STICK" } else { "DRAG RIGHT SIDE" };
-            if app.ui.button(560.0, 520.0, 380.0, 60.0, aim_label, Style::Normal) {
+            if app.ui.button(560.0, row(5.0), 380.0, bh, aim_label, Style::Normal) {
                 app.settings.aim_stick = !app.settings.aim_stick;
             }
-            if app.ui.button(cx - 150.0, 600.0, 300.0, 56.0, "BACK", Style::Primary) {
+            app.ui.text("Touch move", 340.0, row(6.0) + 27.0, 26.0, DIM, Align::Left);
+            let mv_label = if app.settings.aim_drive { "AIM + DRIVE BUTTON" } else { "LEFT STICK" };
+            if app.ui.button(560.0, row(6.0), 380.0, bh, mv_label, Style::Normal) {
+                app.settings.aim_drive = !app.settings.aim_drive;
+            }
+            if app.ui.button(cx - 150.0, row(7.0) + 6.0, 300.0, 50.0, "BACK", Style::Primary) {
                 app.settings.save();
                 app.screen = Screen::Menu;
                 return;
+            }
+            // save as soon as anything changes, in case the app is closed from Android
+            if app.settings.serialize() != before {
+                app.settings.save();
             }
         }
         Screen::HowTo => {
@@ -584,7 +598,7 @@ fn run_menus(app: &mut App) {
                         ("MAP VIEW".into(), "Tap anywhere to fire (your spin reverses). Hold to drive, release to spin again.".into()),
                         ("CHASE".into(), "W A S D or arrows move the tank the way you press, relative to the camera. Mouse or Q E aims. Click or Space fires.".into()),
                         ("MORE".into(), "Shift boosts, R reloads, C switches view, Esc pauses, M music, F fullscreen.".into()),
-                        ("TOUCH".into(), "Left stick drives, drag the right side to aim (or switch to a right aim stick in Settings), hold FIRE. BOOST and R are buttons.".into()),
+                        ("TOUCH".into(), "Left stick drives, drag the right side to aim, hold FIRE. Settings can switch to a right aim stick, or to AIM + DRIVE: the tank goes where you aim while you hold DRIVE.".into()),
                     ],
                 ),
                 (
@@ -985,6 +999,9 @@ const FIRE_BTN: (f32, f32, f32) = (1130.0, 560.0, 90.0);
 const BOOST_BTN: (f32, f32, f32) = (975.0, 625.0, 58.0);
 const RELOAD_BTN: (f32, f32, f32) = (1190.0, 410.0, 46.0);
 const STICK_R: f32 = 95.0;
+// "aim + drive button" touch layout
+const DRIVE_BTN: (f32, f32, f32) = (190.0, 540.0, 105.0);
+const REV_BTN: (f32, f32, f32) = (390.0, 640.0, 46.0);
 
 /// Keyboard + mouse (+ test script) input for the chase-camera scheme.
 /// W/S throttle, A/D steer (or arrows), mouse or Q/E aim, Space or left
@@ -1072,6 +1089,19 @@ fn screen_drive(aim: f32, hull: f32, right: f32, fwd: f32, mag: f32) -> (f32, f3
     (steer, sign * mag * go.max(0.1))
 }
 
+/// "Aim + drive button" controls: the hull turns to the aim direction and the
+/// DRIVE button moves it forward along that direction; REV backs straight up.
+fn aim_drive_move(aim: f32, hull: f32, drive: bool, rev: bool) -> (f32, f32) {
+    let diff = wrap(aim - hull);
+    if drive {
+        ((diff * 3.0).clamp(-1.0, 1.0), if diff.abs() < 1.3 { diff.cos().max(0.25) } else { 0.0 })
+    } else if rev {
+        (0.0, -1.0)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 /// Twin-stick touch input: a floating stick on the left drives (push toward
 /// where you want to go, relative to the camera), dragging the right side
 /// aims, and FIRE / BOOST / R are held buttons. Returns
@@ -1092,6 +1122,8 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
         }
     }
     let (mut fire, mut boost, mut reload) = (false, false, false);
+    let (mut drive_btn, mut rev_btn) = (false, false);
+    let aim_drive = app.settings.aim_drive;
     let mut stick_delta: Option<Vec2> = None;
     for t in &ts {
         if matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
@@ -1127,8 +1159,12 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
             boost = true;
         } else if inside(RELOAD_BTN) {
             reload = true;
+        } else if aim_drive && inside(DRIVE_BTN) {
+            drive_btn = true;
+        } else if aim_drive && inside(REV_BTN) {
+            rev_btn = true;
         } else if t.phase == TouchPhase::Started {
-            if v.x < 560.0 && v.y > 160.0 && app.touch.stick.is_none() {
+            if !aim_drive && v.x < 560.0 && v.y > 160.0 && app.touch.stick.is_none() {
                 app.touch.stick = Some((t.id, v));
                 stick_delta = Some(Vec2::ZERO);
             } else if v.x >= 560.0 && v.y > 90.0 && app.touch.look.is_none() {
@@ -1142,7 +1178,15 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
         app.touch.look_knob = Vec2::ZERO;
     }
     app.touch.flags = (fire, boost, reload);
+    app.touch.drive_flags = (drive_btn, rev_btn);
     let (mut steer, mut throttle) = (0.0, 0.0);
+    if aim_drive {
+        // the tank always heads where the camera aims; DRIVE moves it forward
+        let (st, th) = aim_drive_move(app.aim, hull, drive_btn, rev_btn);
+        steer = st;
+        throttle = th;
+        return (steer, throttle, fire, boost, reload);
+    }
     if let Some(d) = stick_delta {
         app.touch.knob = d;
         let m = (d.length() / STICK_R).min(1.0);
@@ -1174,17 +1218,31 @@ fn draw_touch_controls(app: &App) {
         draw_circle_lines(x, y, b.2 * u, 3.0 * u, Color::new(col.r, col.g, col.b, 0.9));
         app.ui.text(label, b.0, b.1, if b.2 > 80.0 { 30.0 } else { 24.0 }, TEXT, Align::Center);
     }
+    if app.settings.aim_drive {
+        let (d, r) = app.touch.drive_flags;
+        for (b, label, on, col) in [
+            (DRIVE_BTN, "DRIVE", d, Color::new(0.4, 0.9, 0.5, 1.0)),
+            (REV_BTN, "REV", r, Color::new(0.8, 0.8, 0.9, 1.0)),
+        ] {
+            let (x, y) = at(b.0, b.1);
+            draw_circle(x, y, b.2 * u, Color::new(col.r, col.g, col.b, if on { 0.55 } else { 0.22 }));
+            draw_circle_lines(x, y, b.2 * u, 3.0 * u, Color::new(col.r, col.g, col.b, 0.9));
+            app.ui.text(label, b.0, b.1, if b.2 > 80.0 { 32.0 } else { 22.0 }, TEXT, Align::Center);
+        }
+    }
     // floating stick: base where the thumb landed, or a hint at rest
     let (ox, oy, active) = match app.touch.stick {
         Some((_, o)) => (o.x, o.y, true),
         None => (190.0, 540.0, false),
     };
-    let (x, y) = at(ox, oy);
-    draw_circle(x, y, STICK_R * u, Color::new(1.0, 1.0, 1.0, if active { 0.14 } else { 0.07 }));
-    draw_circle_lines(x, y, STICK_R * u, 3.0 * u, Color::new(1.0, 1.0, 1.0, if active { 0.6 } else { 0.3 }));
-    let k = if active { app.touch.knob.clamp_length_max(STICK_R) } else { Vec2::ZERO };
-    let (kx, ky) = at(ox + k.x, oy + k.y);
-    draw_circle(kx, ky, 38.0 * u, Color::new(1.0, 1.0, 1.0, if active { 0.5 } else { 0.2 }));
+    if !app.settings.aim_drive {
+        let (x, y) = at(ox, oy);
+        draw_circle(x, y, STICK_R * u, Color::new(1.0, 1.0, 1.0, if active { 0.14 } else { 0.07 }));
+        draw_circle_lines(x, y, STICK_R * u, 3.0 * u, Color::new(1.0, 1.0, 1.0, if active { 0.6 } else { 0.3 }));
+        let k = if active { app.touch.knob.clamp_length_max(STICK_R) } else { Vec2::ZERO };
+        let (kx, ky) = at(ox + k.x, oy + k.y);
+        draw_circle(kx, ky, 38.0 * u, Color::new(1.0, 1.0, 1.0, if active { 0.5 } else { 0.2 }));
+    }
     if app.settings.aim_stick {
         // right aim stick: base where the thumb landed, or a hint at rest
         let (ox, oy, active) = match app.touch.look {
@@ -1575,6 +1633,7 @@ fn draw_hud(app: &mut App, me_alive: bool) {
         let hint = match (drive, app.touch_mode) {
             (false, _) => "TAP = FIRE     HOLD = DRIVE",
             (true, false) => "WASD DRIVE  MOUSE AIM  CLICK FIRE  SHIFT BOOST",
+            (true, true) if app.settings.aim_drive => "AIM WITH THE RIGHT SIDE   HOLD DRIVE TO MOVE",
             (true, true) if app.settings.aim_stick => "LEFT STICK DRIVE   RIGHT STICK AIM",
             (true, true) => "LEFT STICK DRIVE   DRAG RIGHT TO AIM",
         };
@@ -1585,6 +1644,22 @@ fn draw_hud(app: &mut App, me_alive: bool) {
 #[cfg(test)]
 mod drive_tests {
     use super::*;
+    #[test]
+    fn aim_drive_buttons() {
+        // aiming straight ahead: DRIVE goes full speed with no steering
+        let (s, t) = aim_drive_move(0.0, 0.0, true, false);
+        assert!(s.abs() < 1e-4 && t > 0.99);
+        // aim to the right of the hull: turn right and still creep forward
+        let (s, t) = aim_drive_move(0.8, 0.0, true, false);
+        assert!(s > 0.9 && t > 0.2 && t < 0.8);
+        // aim behind the hull: turn in place, no forward motion
+        let (_, t) = aim_drive_move(3.0, 0.0, true, false);
+        assert_eq!(t, 0.0);
+        // not holding DRIVE: stand still while the camera turns
+        assert_eq!(aim_drive_move(1.0, 0.0, false, false), (0.0, 0.0));
+        assert_eq!(aim_drive_move(1.0, 0.0, false, true), (0.0, -1.0));
+    }
+
     #[test]
     fn screen_relative() {
         // facing the camera's forward: W drives forward, no steering
