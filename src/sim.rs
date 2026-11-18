@@ -102,6 +102,8 @@ pub enum PickupKind {
     Speed,
     Rapid,
     Shield,
+    /// Capture-the-flag only: a secret item the tank keeps until it uses it.
+    Mystery,
 }
 
 impl PickupKind {
@@ -116,6 +118,9 @@ impl PickupKind {
         self as u8
     }
     pub fn from_code(c: u8) -> Option<Self> {
+        if c == 5 {
+            return Some(PickupKind::Mystery);
+        }
         Self::ALL.get(c as usize).copied()
     }
     pub fn label(self) -> &'static str {
@@ -125,6 +130,7 @@ impl PickupKind {
             PickupKind::Speed => "NITRO",
             PickupKind::Rapid => "RAPID",
             PickupKind::Shield => "SHIELD",
+            PickupKind::Mystery => "MYSTERY",
         }
     }
     /// RGB colour used by the renderer and HUD.
@@ -135,6 +141,7 @@ impl PickupKind {
             PickupKind::Speed => (1.0, 0.65, 0.15),
             PickupKind::Rapid => (0.95, 0.35, 0.25),
             PickupKind::Shield => (0.35, 0.75, 1.0),
+            PickupKind::Mystery => (0.75, 0.45, 1.0),
         }
     }
 }
@@ -224,6 +231,151 @@ pub fn default_obstacles() -> Vec<Obstacle> {
     v
 }
 
+/// Machinery gates: fixed turrets that fire single shots at a steady
+/// rhythm. A gate belongs to a team and its shots never hurt that team.
+#[derive(Clone, Debug)]
+pub struct Gate {
+    pub x: f32,
+    pub y: f32,
+    pub angle: f32,
+    pub team: u8,
+    pub period: f32,
+    /// Seconds until the next volley.
+    pub timer: f32,
+}
+
+pub const GATE_OWNER: u32 = u32::MAX;
+/// The last stretch before a volley, when the barrel glows.
+pub const GATE_WARN: f32 = 0.8;
+const GATE_SPEED: f32 = BULLET_SPEED * 0.85;
+
+impl Gate {
+    pub fn charging(&self) -> bool {
+        self.timer < GATE_WARN
+    }
+}
+
+/// The "Foundry" arena for capture the flag: a steel works with a slag pit in
+/// the middle, walled-off centre lane and a pair of gates guarding each base.
+pub fn foundry_obstacles() -> Vec<Obstacle> {
+    use ObstacleKind::*;
+    let o = |x: f32, y: f32, w: f32, h: f32, kind| Obstacle { x, y, w, h, kind };
+    let left = [
+        // gate housings
+        o(230.0, 240.0, 40.0, 40.0, Block),
+        o(230.0, 520.0, 40.0, 40.0, Block),
+        // cover and bottlenecks
+        o(400.0, 110.0, 50.0, 50.0, Crate),
+        o(400.0, 640.0, 50.0, 50.0, Crate),
+        o(470.0, 330.0, 30.0, 140.0, Sandbag),
+        o(330.0, 350.0, 110.0, 100.0, Pond),
+        o(560.0, 200.0, 60.0, 60.0, Rock),
+        o(560.0, 540.0, 60.0, 60.0, Rock),
+        o(560.0, 40.0, 60.0, 90.0, Block),
+        o(560.0, 670.0, 60.0, 90.0, Block),
+        o(350.0, 180.0, 30.0, 30.0, Tree),
+        o(350.0, 590.0, 30.0, 30.0, Tree),
+    ];
+    let mut v = Vec::new();
+    for ob in left.iter() {
+        v.push(ob.clone());
+        v.push(Obstacle { x: ARENA_W - ob.x - ob.w, ..ob.clone() });
+    }
+    // the slag pit and the tower over it
+    v.push(o(620.0, 340.0, 200.0, 120.0, Mud));
+    v.push(o(680.0, 360.0, 80.0, 80.0, Tower));
+    v.push(o(705.0, 250.0, 30.0, 30.0, Tree));
+    v.push(o(705.0, 520.0, 30.0, 30.0, Tree));
+    v
+}
+
+/// Number of arenas: 0 classic meadow, 1 foundry, 2 facility.
+pub const ARENAS: u8 = 3;
+
+pub fn arena_name(a: u8) -> &'static str {
+    match a {
+        1 => "FOUNDRY",
+        2 => "FACILITY",
+        _ => "MEADOW",
+    }
+}
+
+pub fn arena_obstacles(a: u8) -> Vec<Obstacle> {
+    match a {
+        1 => foundry_obstacles(),
+        2 => facility_obstacles(),
+        _ => default_obstacles(),
+    }
+}
+
+pub fn arena_gates(a: u8) -> Vec<Gate> {
+    match a {
+        1 => foundry_gates(),
+        2 => facility_gates(),
+        _ => Vec::new(),
+    }
+}
+
+/// The "Facility": a steel-floored bunker. Two bases at the ends, a grated
+/// corridor down the middle behind staggered barriers, and a pair of turret
+/// bays per team that shoot straight across the field, top ones down and
+/// bottom ones up.
+pub fn facility_obstacles() -> Vec<Obstacle> {
+    use ObstacleKind::*;
+    let o = |x: f32, y: f32, w: f32, h: f32, kind| Obstacle { x, y, w, h, kind };
+    let left = [
+        // turret housings
+        o(415.0, 130.0, 40.0, 40.0, Block),
+        o(415.0, 630.0, 40.0, 40.0, Block),
+        // corridor mouth walls with the entrance left open in the middle
+        o(520.0, 40.0, 40.0, 250.0, Block),
+        o(520.0, 510.0, 40.0, 250.0, Block),
+        // shield in front of the flag
+        o(150.0, 330.0, 30.0, 140.0, Block),
+        // pillars narrowing the approach
+        o(300.0, 300.0, 50.0, 50.0, Rock),
+        o(300.0, 450.0, 50.0, 50.0, Rock),
+        // crates in the corner bays
+        o(300.0, 60.0, 50.0, 50.0, Crate),
+        o(300.0, 690.0, 50.0, 50.0, Crate),
+        // coolant spills that slow the corridor
+        o(600.0, 350.0, 80.0, 100.0, Mud),
+    ];
+    let mut v = Vec::new();
+    for ob in left.iter() {
+        v.push(ob.clone());
+        v.push(Obstacle { x: ARENA_W - ob.x - ob.w, ..ob.clone() });
+    }
+    // staggered barriers in the middle of the corridor
+    v.push(o(700.0, 200.0, 40.0, 110.0, Block));
+    v.push(o(700.0, 490.0, 40.0, 110.0, Block));
+    v
+}
+
+pub fn facility_gates() -> Vec<Gate> {
+    let period = 2.6;
+    let down = PI / 2.0;
+    let mk = |x: f32, y: f32, angle: f32, team: u8, off: f32| Gate { x, y, angle, team, period, timer: off };
+    vec![
+        mk(435.0, 150.0, down, 0, 1.0),
+        mk(435.0, 650.0, -down, 0, 1.0 + period / 2.0),
+        mk(ARENA_W - 435.0, 150.0, down, 1, 1.0 + period / 2.0),
+        mk(ARENA_W - 435.0, 650.0, -down, 1, 1.0),
+    ]
+}
+
+/// Two gates per base, staggered, firing out into the arena.
+pub fn foundry_gates() -> Vec<Gate> {
+    let period = 2.6;
+    let mk = |x: f32, y: f32, angle: f32, team: u8, off: f32| Gate { x, y, angle, team, period, timer: off };
+    vec![
+        mk(250.0, 260.0, 0.0, 0, 1.0),
+        mk(250.0, 540.0, 0.0, 0, 1.0 + period / 2.0),
+        mk(ARENA_W - 250.0, 260.0, PI, 1, 1.0 + period / 2.0),
+        mk(ARENA_W - 250.0, 540.0, PI, 1, 1.0),
+    ]
+}
+
 // --------------------------------------------------------------- tanks ----
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -256,11 +408,13 @@ pub struct Control {
     pub boost: bool,
     pub reload: bool,
     pub aim: f32,
+    /// Use the held mystery item (capture the flag).
+    pub use_item: bool,
 }
 
 impl Default for Control {
     fn default() -> Self {
-        Control { drive: false, held: false, steer: 0.0, throttle: 0.0, fire: false, boost: false, reload: false, aim: 0.0 }
+        Control { drive: false, held: false, steer: 0.0, throttle: 0.0, fire: false, boost: false, reload: false, aim: 0.0, use_item: false }
     }
 }
 
@@ -271,8 +425,8 @@ impl Control {
 
     pub fn encode(&self) -> String {
         format!(
-            "{},{},{:.2},{:.2},{},{},{},{:.2}",
-            self.drive as u8, self.held as u8, self.steer, self.throttle, self.fire as u8, self.boost as u8, self.reload as u8, self.aim
+            "{},{},{:.2},{:.2},{},{},{},{:.2},{}",
+            self.drive as u8, self.held as u8, self.steer, self.throttle, self.fire as u8, self.boost as u8, self.reload as u8, self.aim, self.use_item as u8
         )
     }
 
@@ -282,7 +436,7 @@ impl Control {
             return Some(Control::classic(s == "1"));
         }
         let f: Vec<&str> = s.split(',').collect();
-        if f.len() != 8 {
+        if f.len() != 8 && f.len() != 9 {
             return None;
         }
         let b = |x: &str| x == "1";
@@ -296,6 +450,7 @@ impl Control {
             boost: b(f[5]),
             reload: b(f[6]),
             aim: n(f[7])?,
+            use_item: f.get(8).map(|x| b(x)).unwrap_or(false),
         })
     }
 }
@@ -329,6 +484,17 @@ pub struct Tank {
     boost_lock: bool,
     pub kind: u8,
     pub mud: bool,
+    /// Capture the flag: held mystery item (0 none, 1 bomb, 2 shield, 3 spread), spread-shot time left.
+    pub item: u8,
+    pub spread_t: f32,
+    /// Seconds until respawn while destroyed (capture the flag).
+    pub respawn_t: f32,
+    pub(crate) dead_seen: bool,
+    pub(crate) left: bool,
+    pub(crate) last_hit: Option<u32>,
+    pub(crate) item_prev: bool,
+    /// Where this tank (re)spawns: x, y, angle.
+    pub spawn: (f32, f32, f32),
     pub ctrl: Control,
     pub ai: Option<Ai>,
 }
@@ -360,6 +526,14 @@ impl Tank {
             boost_lock: false,
             kind: 0,
             mud: false,
+            item: 0,
+            spread_t: 0.0,
+            respawn_t: 0.0,
+            dead_seen: false,
+            left: false,
+            last_hit: None,
+            item_prev: false,
+            spawn: (x, y, angle),
             ctrl: Control::default(),
             ai: if ai {
                 Some(Ai { mode: AiMode::Idle, fire_wait: 1.0, drive_wait: 1.5 })
@@ -481,11 +655,17 @@ pub struct World {
     pub spawn_timer: f32,
     pub end_timer: Option<f32>,
     pub time: f32,
-    rng: Rng,
-    next_pickup_id: u32,
+    pub(crate) rng: Rng,
+    pub(crate) next_pickup_id: u32,
+    /// Present only in capture-the-flag matches.
+    pub ctf: Option<crate::ctf::Ctf>,
+    /// Machinery gates (Foundry and Facility arenas).
+    pub gates: Vec<Gate>,
+    /// Which arena this match is played in (see `ARENAS`).
+    pub arena: u8,
 }
 
-fn wrap_angle(mut a: f32) -> f32 {
+pub(crate) fn wrap_angle(mut a: f32) -> f32 {
     while a > PI {
         a -= 2.0 * PI;
     }
@@ -497,7 +677,7 @@ fn wrap_angle(mut a: f32) -> f32 {
 
 /// If a circle overlaps the rect, return the pushed-out centre and the
 /// contact normal.
-fn circle_rect(x: f32, y: f32, r: f32, o: &Obstacle) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn circle_rect(x: f32, y: f32, r: f32, o: &Obstacle) -> Option<(f32, f32, f32, f32)> {
     let cx = x.clamp(o.x, o.x + o.w);
     let cy = y.clamp(o.y, o.y + o.h);
     let dx = x - cx;
@@ -538,6 +718,7 @@ impl World {
                 let y = ARENA_H * (k as f32 + 1.0) / (n as f32 + 1.0);
                 let (x, angle) = if team == 0 { (90.0, 0.0) } else { (ARENA_W - 90.0, PI) };
                 let mut t = Tank::new(s.id, s.team, &s.name, x, y, angle, s.ai);
+                t.spawn = (x, y, angle);
                 t.set_kind(s.kind);
                 tanks.push(t);
             }
@@ -555,6 +736,9 @@ impl World {
             time: 0.0,
             rng: Rng::new(seed),
             next_pickup_id: 1,
+            ctf: None,
+            gates: Vec::new(),
+            arena: 0,
         }
     }
 
@@ -568,6 +752,7 @@ impl World {
     /// Remove a player mid-game (disconnect). Counts as being destroyed.
     pub fn kill_player(&mut self, id: u32) {
         if let Some(t) = self.tank_mut(id) {
+            t.left = true;
             if t.alive {
                 t.alive = false;
                 t.hp = 0;
@@ -587,16 +772,31 @@ impl World {
         teams
     }
 
+    /// Advances the world in small fixed slices so a slow frame (phones) cannot make
+    /// bullets skip across thin walls or bounce differently from the aim preview.
     pub fn step(&mut self, dt: f32) {
-        let dt = dt.min(0.05);
+        let mut left = dt.min(0.05);
+        while left > 1e-6 {
+            let d = left.min(1.0 / 120.0);
+            self.step_once(d);
+            left -= d;
+        }
+    }
+
+    fn step_once(&mut self, dt: f32) {
         self.time += dt;
         if self.phase == Phase::GameOver {
             // Bullets and particles may keep flying; tanks stop.
             self.update_bullets(dt);
             return;
         }
+        self.update_gates(dt);
 
-        self.run_ai(dt);
+        if self.ctf.is_some() {
+            self.ctf_ai(dt);
+        } else {
+            self.run_ai(dt);
+        }
 
         let mut new_bullets = Vec::new();
         for t in self.tanks.iter_mut() {
@@ -608,6 +808,10 @@ impl World {
         self.update_bullets(dt);
         self.update_pickups(dt);
 
+        if self.ctf.is_some() {
+            self.ctf_update(dt);
+            return;
+        }
         if self.tanks.len() >= 2 {
             if self.alive_teams().len() <= 1 {
                 let t = self.end_timer.get_or_insert(END_DELAY);
@@ -640,6 +844,7 @@ impl World {
         t.speed_t = (t.speed_t - dt).max(0.0);
         t.rapid_t = (t.rapid_t - dt).max(0.0);
         t.shield_t = (t.shield_t - dt).max(0.0);
+        t.spread_t = (t.spread_t - dt).max(0.0);
 
         if t.ctrl.drive {
             Self::update_drive(t, dt, out, events);
@@ -723,18 +928,15 @@ impl World {
         if !t.can_fire() {
             return false;
         }
-        let (c, s) = (t.turret.cos(), t.turret.sin());
         let muzzle = TANK_R + 8.0;
-        let (bx, by) = (t.x + c * muzzle, t.y + s * muzzle);
-        out.push(Bullet {
-            x: bx,
-            y: by,
-            vx: c * BULLET_SPEED,
-            vy: s * BULLET_SPEED,
-            bounces: 0,
-            owner: t.id,
-            team: t.team,
-        });
+        let fan: &[f32] = if t.spread_t > 0.0 { &[-0.22, 0.0, 0.22] } else { &[0.0] };
+        let (mut bx, mut by) = (t.x, t.y);
+        for off in fan {
+            let a = t.turret + off;
+            let (c, s) = (a.cos(), a.sin());
+            (bx, by) = (t.x + c * muzzle, t.y + s * muzzle);
+            out.push(Bullet { x: bx, y: by, vx: c * BULLET_SPEED, vy: s * BULLET_SPEED, bounces: 0, owner: t.id, team: t.team });
+        }
         events.push(Event { kind: EventKind::Fire, x: bx, y: by, a: t.turret });
         t.ammo -= 1;
         t.cooldown = t.cooldown_len();
@@ -781,6 +983,31 @@ impl World {
         }
     }
 
+    /// Count down each gate and let it loose when its time comes.
+    /// Move the match into another arena.
+    pub fn set_arena(&mut self, arena: u8) {
+        let a = arena % ARENAS;
+        self.arena = a;
+        self.obstacles = arena_obstacles(a);
+        self.gates = arena_gates(a);
+    }
+
+    fn update_gates(&mut self, dt: f32) {
+        let mut shots = Vec::new();
+        let mut evs = Vec::new();
+        for g in self.gates.iter_mut() {
+            g.timer -= dt;
+            if g.timer <= 0.0 {
+                g.timer += g.period;
+                let (c, s) = (g.angle.cos(), g.angle.sin());
+                shots.push(Bullet { x: g.x + c * 34.0, y: g.y + s * 34.0, vx: c * GATE_SPEED, vy: s * GATE_SPEED, bounces: 0, owner: GATE_OWNER, team: g.team });
+                evs.push(Event { kind: EventKind::Fire, x: g.x, y: g.y, a: g.angle });
+            }
+        }
+        self.bullets.extend(shots);
+        self.events.extend(evs);
+    }
+
     fn update_bullets(&mut self, dt: f32) {
         let mut bullets = std::mem::take(&mut self.bullets);
         bullets.retain_mut(|b| self.step_bullet(b, dt));
@@ -804,6 +1031,7 @@ impl World {
                 self.events.push(Event { kind: EventKind::Hit, x: b.x, y: b.y, a: 0.0 });
                 if t.shield_t <= 0.0 {
                     t.hp -= 1;
+                    t.last_hit = Some(b.owner);
                     if t.hp <= 0 {
                         t.alive = false;
                         t.hp = 0;
@@ -870,8 +1098,8 @@ impl World {
         let muzzle = TANK_R + 8.0;
         let mut b = Bullet { x: x + c * muzzle, y: y + s * muzzle, vx: c * BULLET_SPEED, vy: s * BULLET_SPEED, bounces: 0, owner: 0, team };
         let mut pts = vec![(b.x, b.y)];
-        let dt = 6.0 / BULLET_SPEED; // 6 units per step
-        for _ in 0..500 {
+        let dt = 2.0 / BULLET_SPEED; // 2 units per step
+        for _ in 0..1500 {
             b.x += b.vx * dt;
             b.y += b.vy * dt;
             let r = TANK_R + BULLET_R;
@@ -897,14 +1125,18 @@ impl World {
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0.0 {
             self.spawn_timer = self.rng.range(7.0, 13.0);
-            if self.pickups.len() < MAX_PICKUPS {
+            if self.ctf.is_some() {
+                self.spawn_timer = self.rng.range(5.0, 9.0);
+            }
+            let cap = if self.ctf.is_some() { MAX_PICKUPS + 3 } else { MAX_PICKUPS };
+            if self.pickups.len() < cap {
                 self.spawn_pickup();
             }
         }
         let mut taken: Vec<(usize, usize)> = Vec::new();
         for (pi, p) in self.pickups.iter().enumerate() {
             for (ti, t) in self.tanks.iter().enumerate() {
-                if !t.alive {
+                if !t.alive || (p.kind == PickupKind::Mystery && t.item != 0) {
                     continue;
                 }
                 let (dx, dy) = (t.x - p.x, t.y - p.y);
@@ -918,6 +1150,9 @@ impl World {
         for &(pi, ti) in taken.iter().rev() {
             // Index-safe: `taken` has one entry per pickup, ascending.
             let p = self.pickups.remove(pi);
+            if p.kind == PickupKind::Mystery {
+                self.tanks[ti].item = 1 + self.rng.below(3) as u8;
+            }
             Self::apply_pickup(&mut self.tanks[ti], p.kind);
             self.events.push(Event { kind: EventKind::Pickup, x: p.x, y: p.y, a: p.kind.code() as f32 });
         }
@@ -933,6 +1168,7 @@ impl World {
             PickupKind::Speed => t.speed_t = BUFF_TIME,
             PickupKind::Rapid => t.rapid_t = BUFF_TIME,
             PickupKind::Shield => t.shield_t = SHIELD_TIME,
+            PickupKind::Mystery => {}
         }
     }
 
@@ -944,7 +1180,11 @@ impl World {
             let near_tank = self.tanks.iter().any(|t| t.alive && (t.x - x).hypot(t.y - y) < 60.0);
             let near_pickup = self.pickups.iter().any(|p| (p.x - x).hypot(p.y - y) < 60.0);
             if !blocked && !near_tank && !near_pickup {
-                let kind = PickupKind::ALL[self.rng.below(PickupKind::ALL.len())];
+                let kind = if self.ctf.is_some() && self.rng.f32() < 0.65 {
+                    PickupKind::Mystery
+                } else {
+                    PickupKind::ALL[self.rng.below(PickupKind::ALL.len())]
+                };
                 let id = self.next_pickup_id;
                 self.next_pickup_id += 1;
                 self.pickups.push(Pickup { id, x, y, kind });
@@ -1051,14 +1291,23 @@ impl World {
             self.pickups.iter().map(|p| format!("{},{:.0},{:.0},{}", p.id, p.x, p.y, p.kind.code())).collect();
         let evs: Vec<String> =
             events.iter().map(|e| format!("{},{:.0},{:.0},{:.2}", e.kind.code(), e.x, e.y, e.a)).collect();
-        format!("STATE:{}:{}:{}:{}:{}:{}", phase, winner, tanks.join(";"), bullets.join(";"), pickups.join(";"), evs.join(";"))
+        let mut out = format!("STATE:{}:{}:{}:{}:{}:{}", phase, winner, tanks.join(";"), bullets.join(";"), pickups.join(";"), evs.join(";"));
+        if let Some(c) = &self.ctf {
+            out.push(':');
+            out.push_str(&c.encode(self));
+        } else if !self.gates.is_empty() {
+            // gate timers keep the barrels glowing in step on every screen
+            let g: Vec<String> = self.gates.iter().map(|g| format!("{:.2}", g.timer)).collect();
+            out.push_str(&format!(":0|||||{}", g.join(";")));
+        }
+        out
     }
 
     /// Apply a snapshot produced by `encode_state`. Returns the events it
     /// carried, or None if the packet is malformed.
     pub fn apply_state(&mut self, msg: &str) -> Option<Vec<Event>> {
-        let parts: Vec<&str> = msg.splitn(7, ':').collect();
-        if parts.len() != 7 || parts[0] != "STATE" {
+        let parts: Vec<&str> = msg.splitn(8, ':').collect();
+        if (parts.len() != 7 && parts.len() != 8) || parts[0] != "STATE" {
             return None;
         }
         let pf = |s: &str| s.parse::<f32>().ok();
@@ -1126,6 +1375,9 @@ impl World {
             if let (Some(kind), Some(x), Some(y), Some(a)) = (EventKind::from_code(f[0]), pf(f[1]), pf(f[2]), pf(f[3])) {
                 events.push(Event { kind, x, y, a });
             }
+        }
+        if let Some(sec) = parts.get(7) {
+            crate::ctf::apply(self, sec);
         }
         Some(events)
     }
@@ -1560,7 +1812,7 @@ mod tests {
 
     #[test]
     fn control_roundtrips_and_rejects_garbage() {
-        let c = Control { drive: true, held: false, steer: -1.0, throttle: 0.5, fire: true, boost: true, reload: false, aim: 2.25 };
+        let c = Control { drive: true, held: false, steer: -1.0, throttle: 0.5, fire: true, boost: true, reload: false, aim: 2.25, use_item: true };
         assert_eq!(Control::decode(&c.encode()), Some(c));
         assert_eq!(Control::decode("1"), Some(Control::classic(true)));
         assert_eq!(Control::decode("0"), Some(Control::classic(false)));
@@ -1568,6 +1820,31 @@ mod tests {
         assert!(Control::decode("nonsense").is_none());
         assert!(Control::decode("1,0,x,0,0,0,0,0").is_none());
         assert!(Control::decode("1,0,NaN,0,0,0,0,0").is_none());
+    }
+
+    #[test]
+    fn slow_frames_do_not_change_where_a_shot_goes() {
+        // Same shot on the Facility floor at 120 fps and at 20 fps: identical bounce points,
+        // and both follow the aim line.
+        for angle in [0.3f32, 0.9, 2.2, -0.7, -2.4] {
+            let mut ends = Vec::new();
+            for dt in [1.0 / 120.0, 0.05] {
+                let mut w = World::build(&[spec(0, 0, false), spec(1, 1, false)], 1, false, 2);
+                w.tank_mut(1).unwrap().x = 1400.0;
+                w.tank_mut(1).unwrap().y = 780.0;
+                let (x, y) = (w.tank(0).unwrap().x, w.tank(0).unwrap().y);
+                let (pts, _) = w.trace_shot(x, y, angle, 0);
+                let (c, s) = (angle.cos(), angle.sin());
+                w.bullets.push(Bullet { x: x + c * 26.0, y: y + s * 26.0, vx: c * BULLET_SPEED, vy: s * BULLET_SPEED, bounces: 0, owner: 0, team: 0 });
+                let mut seen = 0;
+                for _ in 0..(1.2 / dt) as usize {
+                    w.step(dt);
+                    seen = seen.max(w.bullets.first().map_or(0, |b| b.bounces));
+                }
+                ends.push((seen, pts.len()));
+            }
+            assert_eq!(ends[0].0, ends[1].0, "angle {angle}: bounces differ with frame rate {ends:?}");
+        }
     }
 
     #[test]
@@ -1630,6 +1907,58 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn foundry_is_symmetric_with_clear_bases_and_team_gates() {
+        let obs = foundry_obstacles();
+        for o in &obs {
+            assert!(o.x >= 0.0 && o.y >= 0.0 && o.x + o.w <= ARENA_W && o.y + o.h <= ARENA_H, "{o:?} inside the arena");
+            if o.solid_tank() {
+                assert!(o.x > 200.0 && o.x + o.w < ARENA_W - 200.0, "bases clear: {o:?}");
+            }
+            let m = (ARENA_W - o.x - o.w, o.y);
+            assert!(obs.iter().any(|q| q.kind == o.kind && (q.x - m.0).abs() < 0.5 && (q.y - m.1).abs() < 0.5), "mirror of {o:?}");
+        }
+        let solid: Vec<_> = obs.iter().filter(|o| o.solid_tank()).collect();
+        for (i, a) in solid.iter().enumerate() {
+            for b in solid.iter().skip(i + 1) {
+                let apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+        // every gate sits on a housing and its muzzle is in the open
+        for g in foundry_gates() {
+            assert!(obs.iter().any(|o| g.x > o.x && g.x < o.x + o.w && g.y > o.y && g.y < o.y + o.h && o.kind == ObstacleKind::Block), "housing for {g:?}");
+            let (mx, my) = (g.x + g.angle.cos() * 34.0, g.y + g.angle.sin() * 34.0);
+            assert!(obs.iter().all(|o| !(mx > o.x && mx < o.x + o.w && my > o.y && my < o.y + o.h && o.solid_bullet())), "muzzle clear {g:?}");
+        }
+    }
+
+    #[test]
+    fn gates_fire_on_a_rhythm_and_spare_their_own_team() {
+        let mut w = World::new_match(&[PlayerSpec { id: 0, name: "a".into(), team: 0, ai: false, kind: 0 }, PlayerSpec { id: 1, name: "b".into(), team: 1, ai: false, kind: 0 }], 1);
+        w.obstacles.clear();
+        w.gates = vec![Gate { x: 300.0, y: 400.0, angle: 0.0, team: 0, period: 2.0, timer: 1.5 }];
+        // blue (team 0, the gate's own) stands in the line of fire, red further along
+        w.tank_mut(0).unwrap().x = 500.0;
+        w.tank_mut(0).unwrap().y = 400.0;
+        w.tank_mut(1).unwrap().x = 800.0;
+        w.tank_mut(1).unwrap().y = 400.0;
+        assert!(!w.gates[0].charging());
+        for _ in 0..16 {
+            w.step(0.05);
+        }
+        assert!(w.gates[0].charging(), "the barrel glows before the volley");
+        for _ in 0..16 {
+            w.step(0.05);
+        }
+        assert!(!w.bullets.is_empty(), "a shot left the gate");
+        for _ in 0..40 {
+            w.step(0.05);
+        }
+        assert_eq!(w.tank(0).unwrap().hp, w.tank(0).unwrap().max_hp(), "own gate never hurts its team");
+        assert!(w.tank(1).unwrap().hp < w.tank(1).unwrap().max_hp(), "the enemy is hit");
     }
 
     #[test]

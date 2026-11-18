@@ -107,3 +107,21 @@ Font: `assets/fonts/font.ttf` is Press Start 2P (SIL Open Font License 1.1, lice
 - The arena is now 1440x800 (was 960x640) with a brick wall, ponds (tanks cannot enter, bullets fly over), mud (slows tanks), crate stacks, trees, concrete blocks, sandbags, rocks and a central watch tower. The layout is fixed and mirrored left/right.
 - Four tank classes, picked in the **GARAGE** (menu button or `G`): Standard, Scout (fast, 2 armour), Heavy (slow, 5 armour), Gunner (8 rounds, rapid fire). Your choice is saved and sent to the host in LAN games; bots use a mix of classes.
 - How to Play is paged (PREV / NEXT, or the arrow keys).
+
+## Touch options (Settings)
+- **Touch aim:** drag the right side, or a floating right stick.
+- **Touch move:** LEFT STICK (twin-stick), or AIM + DRIVE BUTTON: you only aim; the tank turns to where you aim and moves forward while you hold DRIVE (REV backs up).
+- Settings are saved immediately. On Android they live in the app's private storage, so they survive restarts.
+
+
+## Capture the Flag tournament
+
+Pick **CTF VS BOTS** on the menu for a solo run, or switch the host lobby to **GAME: CTF** for LAN play.
+Bots fill every empty slot (they are replaced as people join). Steal the enemy flag and bring it to your own
+base while your flag is safe at home. Destroyed tanks respawn after 4 s. Purple mystery boxes hold one item at
+a time (bomb mine, shield, spread shot), used with **V** or the ITEM button. The 4 minute tournament keeps the
+score secret and reveals it, with a scoreboard, at the end.
+
+CTF is played in the **Foundry** arena: machine gates guard each base and fire single straight shots every 2.6 s (the barrel glows first). Gate shots never hurt the gate's own team; shields block them. The arena has no fence, just a painted boundary line.
+
+Three arenas, chosen on the menu (key A) or by the host in the lobby: **Meadow** (the original), **Foundry** and **Facility** (a steel bunker with a grated corridor and turret bays). Foundry and Facility have machine gates that work in every game mode.

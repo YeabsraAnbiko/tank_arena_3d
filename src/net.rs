@@ -6,7 +6,7 @@
 //!                    (control csv = sim::Control::encode; legacy INPUT:0|1 still works)
 //!   host -> client   WELCOME:<id>  REJECT:<reason>
 //!                    HELLO:<host name>:<players>:<capacity>:<match type>:<in game 0|1>
-//!                    LOBBY:<match type>:<id,name,team,kind;...>
+//!                    LOBBY:<match type>:<ctf 0|1>:<arena>:<id,name,team,kind;...>   (bots, ids >= 100, fill empty CTF slots)
 //!   client -> host:  TEAM:<0|1>   (ask to switch side while in the lobby)
 //!                    STATE:...  (see sim::World::encode_state)
 //!
@@ -17,6 +17,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::ctf::BOT_ID_BASE;
 use crate::sim::{Control, Event, PlayerSpec, World, KINDS};
 
 pub const PORT: u16 = 22122;
@@ -84,6 +85,10 @@ pub struct Host {
     clients: HashMap<SocketAddr, ClientInfo>,
     pub roster: Vec<RosterEntry>,
     pub match_type: u8,
+    /// Capture-the-flag tournament instead of last-team-standing.
+    pub ctf: bool,
+    /// Arena the match will be played in.
+    pub arena: u8,
     pub in_game: bool,
     host_name: String,
     next_id: u32,
@@ -101,6 +106,8 @@ impl Host {
             clients: HashMap::new(),
             roster: vec![RosterEntry { id: 0, name: name.clone(), team: 0, kind: 0 }],
             match_type,
+            ctf: false,
+            arena: 0,
             in_game: false,
             host_name: name,
             next_id: 1,
@@ -325,7 +332,55 @@ impl Host {
         }
     }
 
+    /// Bots that fill the empty slots of a capture-the-flag match.
+    pub fn bot_entries(&self) -> Vec<RosterEntry> {
+        if !self.ctf {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for team in 0..2u8 {
+            let humans = self.team_count(team);
+            for k in 0..(self.match_type as usize).saturating_sub(humans) {
+                let id = BOT_ID_BASE + team as u32 * 10 + k as u32;
+                out.push(RosterEntry { id, name: format!("Bot {}", k + 1 + humans), team, kind: (id % KINDS as u32) as u8 });
+            }
+        }
+        out
+    }
+
+    /// Humans plus bots, as shown in the lobby and used to build the match.
+    pub fn full_roster(&self) -> Vec<RosterEntry> {
+        let mut r = self.roster.clone();
+        r.extend(self.bot_entries());
+        r
+    }
+
+    /// Players for the match: bots get `ai: true`.
+    pub fn match_specs(&self) -> Vec<PlayerSpec> {
+        self.full_roster()
+            .iter()
+            .map(|e| PlayerSpec { id: e.id, name: e.name.clone(), team: e.team, ai: e.id >= BOT_ID_BASE, kind: e.kind })
+            .collect()
+    }
+
+    pub fn cycle_arena(&mut self) {
+        if !self.in_game {
+            self.arena = (self.arena + 1) % crate::sim::ARENAS;
+            self.last_lobby = Instant::now() - LOBBY_INTERVAL;
+        }
+    }
+
+    pub fn toggle_ctf(&mut self) {
+        if !self.in_game {
+            self.ctf = !self.ctf;
+            self.last_lobby = Instant::now() - LOBBY_INTERVAL;
+        }
+    }
+
     pub fn can_start(&self) -> bool {
+        if self.ctf {
+            return !self.roster.is_empty();
+        }
         self.roster.len() >= 2 && self.team_count(0) >= 1 && self.team_count(1) >= 1
     }
 
@@ -334,7 +389,7 @@ impl Host {
             return;
         }
         self.last_lobby = Instant::now();
-        let msg = format!("LOBBY:{}:{}", self.match_type, encode_roster(&self.roster));
+        let msg = format!("LOBBY:{}:{}:{}:{}", self.match_type, self.ctf as u8, self.arena, encode_roster(&self.full_roster()));
         for a in self.clients.keys() {
             self.send(&msg, *a);
         }
@@ -389,7 +444,7 @@ pub enum ClientMsg {
     Hello(HostInfo),
     Welcome(u32),
     Reject(String),
-    Lobby { match_type: u8, roster: Vec<RosterEntry> },
+    Lobby { match_type: u8, ctf: bool, arena: u8, roster: Vec<RosterEntry> },
     State(String),
 }
 
@@ -510,9 +565,11 @@ impl Client {
             }
             "REJECT" => Some(ClientMsg::Reject(arg.to_string())),
             "LOBBY" => {
-                let mut p = arg.splitn(2, ':');
+                let mut p = arg.splitn(4, ':');
                 let mt = p.next()?.parse().ok()?;
-                Some(ClientMsg::Lobby { match_type: mt, roster: decode_roster(p.next().unwrap_or("")) })
+                let ctf = p.next()? == "1";
+                let arena: u8 = p.next()?.parse().ok()?;
+                Some(ClientMsg::Lobby { match_type: mt, ctf, arena: arena % crate::sim::ARENAS, roster: decode_roster(p.next().unwrap_or("")) })
             }
             "STATE" => Some(ClientMsg::State(msg.to_string())),
             _ => None,
@@ -778,7 +835,7 @@ mod tests {
         let mut host = Host::new(23108, "H", 1).unwrap();
         let mut c = join(23108, &mut host, "Bob");
         let id = c.my_id.unwrap();
-        let want = Control { drive: true, steer: -1.0, throttle: 1.0, fire: true, boost: true, reload: false, held: false, aim: 1.57 };
+        let want = Control { drive: true, steer: -1.0, throttle: 1.0, fire: true, boost: true, reload: false, held: false, aim: 1.57, use_item: true };
         let mut got = None;
         for _ in 0..200 {
             host.poll();
@@ -884,5 +941,36 @@ mod tests {
         host.set_profile(5, "Newname", 3);
         let e = host.roster.iter().find(|e| e.id == 5).unwrap();
         assert_eq!((e.name.as_str(), e.kind), ("Newname", 3));
+    }
+
+    #[test]
+    fn ctf_lobby_shows_bots_and_clients_can_build_the_match() {
+        let mut host = Host::new(23194, "Hos", 2).unwrap();
+        host.toggle_ctf();
+        // alone: every other slot is a bot, and the host may start at once
+        assert!(host.can_start());
+        assert_eq!(host.bot_entries().len(), 3);
+        let mut c = join(23194, &mut host, "Kid");
+        let got = pump(&mut host, &mut [&mut c], 600);
+        let (ctf, roster) = got[0]
+            .iter()
+            .rev()
+            .find_map(|m| if let ClientMsg::Lobby { ctf, roster, .. } = m { Some((*ctf, roster.clone())) } else { None })
+            .expect("lobby");
+        assert!(ctf);
+        assert_eq!(roster.len(), 4, "2 humans + 2 bots fill a 2v2");
+        assert_eq!(roster.iter().filter(|e| e.id >= BOT_ID_BASE).count(), 2);
+        // the match the host builds has AI bots; the client's copy mirrors it
+        let specs = host.match_specs();
+        assert_eq!(specs.iter().filter(|s| s.ai).count(), 2);
+        let mut hw = World::new_ctf(&specs, 1);
+        for _ in 0..30 {
+            hw.step(0.03);
+        }
+        let mut cw = World::new_ctf(&roster_to_specs(&roster), 0);
+        assert!(cw.apply_state(&hw.encode_state(&[])).is_some());
+        assert_eq!(cw.tanks.len(), hw.tanks.len());
+        let (a, b) = (&hw.tanks[2], &cw.tanks[2]);
+        assert!((a.x - b.x).abs() < 0.2 && (a.y - b.y).abs() < 0.2, "bot positions arrive");
     }
 }

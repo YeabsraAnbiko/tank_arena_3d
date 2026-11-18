@@ -19,11 +19,13 @@ pub struct Settings {
     /// Touch chase view where aim = move direction and a DRIVE button moves the tank.
     pub aim_drive: bool,
     pub tap_fire: bool,
+    /// Arena used for practice and as the host's default (see `sim::ARENAS`).
+    pub arena: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { name: "Player".into(), music: 0.5, sfx: 0.8, match_type: 2, chase_cam: false, sens: 1.0, tank: 0, aim_stick: false, aim_drive: false, tap_fire: false }
+        Settings { name: "Player".into(), music: 0.5, sfx: 0.8, match_type: 2, chase_cam: false, sens: 1.0, tank: 0, aim_stick: false, aim_drive: false, tap_fire: false, arena: 0 }
     }
 }
 
@@ -72,6 +74,7 @@ impl Settings {
                 "aimstick" => s.aim_stick = v == "1",
                 "aimdrive" => s.aim_drive = v == "1",
                 "tapfire" => s.tap_fire = v == "1",
+                "arena" => s.arena = v.parse::<u8>().unwrap_or(0).min(crate::sim::ARENAS - 1),
                 "tank" => {
                     if let Ok(t) = v.parse::<u8>() {
                         s.tank = t.min(crate::sim::KINDS as u8 - 1);
@@ -85,8 +88,8 @@ impl Settings {
 
     pub fn serialize(&self) -> String {
         format!(
-            "name={}\nmusic={:.2}\nsfx={:.2}\nmatchtype={}\nchase={}\nsens={:.1}\ntank={}\naimstick={}\naimdrive={}\ntapfire={}\n",
-            self.name, self.music, self.sfx, self.match_type, self.chase_cam as u8, self.sens, self.tank, self.aim_stick as u8, self.aim_drive as u8, self.tap_fire as u8
+            "name={}\nmusic={:.2}\nsfx={:.2}\nmatchtype={}\nchase={}\nsens={:.1}\ntank={}\naimstick={}\naimdrive={}\ntapfire={}\narena={}\n",
+            self.name, self.music, self.sfx, self.match_type, self.chase_cam as u8, self.sens, self.tank, self.aim_stick as u8, self.aim_drive as u8, self.tap_fire as u8, self.arena
         )
     }
 
@@ -105,7 +108,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let s = Settings { name: "Zed".into(), music: 0.3, sfx: 0.0, match_type: 4, chase_cam: true, sens: 1.5, tank: 3, aim_stick: true, aim_drive: true, tap_fire: true };
+        let s = Settings { name: "Zed".into(), music: 0.3, sfx: 0.0, match_type: 4, chase_cam: true, sens: 1.5, tank: 3, aim_stick: true, aim_drive: true, tap_fire: true, arena: 2 };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
 

@@ -194,6 +194,84 @@ pub fn make_brick_texture() -> Texture2D {
 }
 
 /// Seamless grass that is repeated across the field outside the arena.
+/// Steel-plate floor of the Facility: team-tinted bays at both ends and a grated corridor between.
+pub fn make_facility_texture() -> Texture2D {
+    let (w, h) = (ARENA_W as i32, ARENA_H as i32);
+    let mut img = Image::gen_image_color(w as u16, h as u16, GRAY);
+    let plate = 100;
+    let seam = Color::new(0.09, 0.10, 0.12, 1.0);
+    for py in 0..h {
+        for px in 0..w {
+            let (tx, ty) = (px / plate, py / plate);
+            let (lx, ly) = (px % plate, py % plate);
+            let tone = 0.88 + 0.24 * hash(tx, ty, 120);
+            let grain = 0.94 + 0.12 * hash(px, py, 121);
+            let mut c = Color::new(0.27 * tone, 0.30 * tone, 0.36 * tone, 1.0);
+            // bay tint
+            let bay = if px < 280 { 0 } else if px > w - 280 { 1 } else { 2 };
+            if bay == 0 {
+                c = mix(c, Color::new(0.20, 0.36, 0.66, 1.0), 0.45);
+            } else if bay == 1 {
+                c = mix(c, Color::new(0.66, 0.22, 0.20, 1.0), 0.45);
+            }
+            // bevel and seams
+            if lx < 2 || ly < 2 {
+                c = seam;
+            } else if lx < 4 || ly < 4 {
+                c = Color::new(c.r * 1.18, c.g * 1.18, c.b * 1.18, 1.0);
+            } else if lx > plate - 4 || ly > plate - 4 {
+                c = Color::new(c.r * 0.82, c.g * 0.82, c.b * 0.82, 1.0);
+            }
+            // rivets
+            for (rx, ry) in [(10, 10), (plate - 10, 10), (10, plate - 10), (plate - 10, plate - 10)] {
+                if (lx - rx) * (lx - rx) + (ly - ry) * (ly - ry) <= 7 {
+                    c = Color::new(0.55, 0.58, 0.64, 1.0);
+                }
+            }
+            c = Color::new(c.r * grain, c.g * grain, c.b * grain, 1.0);
+            // base line where the bay meets the floor
+            if (px - 280).abs() < 3 || (px - (w - 280)).abs() < 3 {
+                c = if bay == 0 || px < 300 { Color::new(0.30, 0.55, 0.95, 1.0) } else { Color::new(0.95, 0.35, 0.30, 1.0) };
+            }
+            // the grated corridor
+            if px >= 560 && px <= 880 {
+                let hole = (px % 12) < 7 && (py % 12) < 7;
+                c = if hole { Color::new(0.04, 0.045, 0.06, 1.0) } else { Color::new(0.17, 0.18, 0.21, 1.0) };
+                if px < 566 || px > 874 {
+                    c = if ((px + py) / 10) % 2 == 0 { Color::new(0.95, 0.78, 0.1, 1.0) } else { Color::new(0.1, 0.1, 0.11, 1.0) };
+                }
+            }
+            img.set_pixel(px as u32, py as u32, c);
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+/// Dark plating that surrounds the Facility floor.
+pub fn make_facility_outer_texture() -> Texture2D {
+    let n = 256;
+    let mut img = Image::gen_image_color(n as u16, n as u16, GRAY);
+    for py in 0..n {
+        for px in 0..n {
+            let (lx, ly) = (px % 64, py % 64);
+            let tone = 0.8 + 0.4 * hash(px / 64, py / 64, 130);
+            let grain = 0.92 + 0.16 * hash(px, py, 131);
+            let mut c = Color::new(0.13 * tone, 0.15 * tone, 0.19 * tone, 1.0);
+            if lx < 2 || ly < 2 {
+                c = Color::new(0.05, 0.055, 0.07, 1.0);
+            } else if lx < 4 || ly < 4 {
+                c = Color::new(c.r * 1.25, c.g * 1.25, c.b * 1.25, 1.0);
+            }
+            img.set_pixel(px as u32, py as u32, Color::new(c.r * grain, c.g * grain, c.b * grain, 1.0));
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
 pub fn make_outer_texture() -> Texture2D {
     let img = paint_meadow(256, 256, 0.8, true, 50);
     let tex = Texture2D::from_image(&img);
@@ -502,6 +580,10 @@ impl TrackAnim {
     }
 }
 
+fn empty_statics() -> Statics {
+    Statics { sky: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None }, outer: Vec::new(), solid: Vec::new(), brick: Vec::new(), layout: Vec::new() }
+}
+
 // ----------------------------------------------------------------- scene ----
 
 /// Everything that never changes, baked once into meshes at start-up so a
@@ -526,10 +608,13 @@ struct Tuft {
 pub struct Scene {
     pub ground: Texture2D,
     pub outer: Texture2D,
+    ground_metal: Texture2D,
+    outer_metal: Texture2D,
     brick: Texture2D,
     batch: std::cell::RefCell<Batch>,
-    statics: Statics,
-    tufts: Vec<Tuft>,
+    /// One baked set per arena: 0 = classic, 1 = foundry (gates).
+    statics: [Statics; 3],
+    tufts: [Vec<Tuft>; 3],
 }
 
 const HAZE: Color = Color::new(0.80, 0.88, 0.92, 1.0);
@@ -545,30 +630,37 @@ impl Scene {
         let mut sc = Scene {
             ground: make_ground_texture(),
             outer: make_outer_texture(),
+            ground_metal: make_facility_texture(),
+            outer_metal: make_facility_outer_texture(),
             brick: make_brick_texture(),
             batch: std::cell::RefCell::new(Batch::new()),
-            statics: Statics { sky: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None }, outer: Vec::new(), solid: Vec::new(), brick: Vec::new(), layout: Vec::new() },
-            tufts: Vec::new(),
+            statics: [empty_statics(), empty_statics(), empty_statics()],
+            tufts: [Vec::new(), Vec::new(), Vec::new()],
         };
-        sc.statics = sc.bake();
-        sc.tufts = sc.make_tufts(&default_obstacles());
+        let (classic, foundry, facility) = (default_obstacles(), foundry_obstacles(), facility_obstacles());
+        sc.statics = [sc.bake(&classic, false), sc.bake(&foundry, false), sc.bake(&facility, true)];
+        sc.tufts = [sc.make_tufts(&classic), sc.make_tufts(&foundry), Vec::new()];
         sc
     }
 
     /// Builds every static mesh once.
-    fn bake(&self) -> Statics {
-        let obstacles = default_obstacles();
+    fn bake(&self, obstacles: &[Obstacle], metal: bool) -> Statics {
         let mut b = Batch::capturing();
-        self.scenery_static(&mut b);
-        self.wall_caps(&mut b);
+        if metal {
+            self.hazard_border(&mut b);
+        } else {
+            self.scenery_static(&mut b);
+            self.boundary_line(&mut b);
+        }
+        self.edge_curb(&mut b, metal);
         for (i, o) in obstacles.iter().enumerate() {
             self.draw_obstacle(&mut b, o, i);
         }
         Statics {
-            sky: self.sky_mesh(),
-            outer: self.outer_meshes(),
+            sky: self.sky_mesh(metal),
+            outer: self.outer_meshes(metal),
             solid: b.finish(),
-            brick: self.brick_wall_meshes(),
+            brick: Vec::new(),
             layout: obstacles.iter().map(|o| (o.x, o.y, o.w, o.h)).collect(),
         }
     }
@@ -586,34 +678,43 @@ impl Scene {
         v
     }
 
-    fn same_layout(&self, world: &World) -> bool {
-        world.obstacles.len() == self.statics.layout.len() && world.obstacles.iter().zip(&self.statics.layout).all(|(o, l)| (o.x, o.y, o.w, o.h) == *l)
+    fn same_layout(world: &World, st: &Statics) -> bool {
+        world.obstacles.len() == st.layout.len() && world.obstacles.iter().zip(&st.layout).all(|(o, l)| (o.x, o.y, o.w, o.h) == *l)
     }
 
     pub fn draw_world(&self, world: &World, time: f32, tracks: &TrackAnim, aim: Option<&(Vec<(f32, f32)>, bool)>, hide_pips_of: Option<u32>, eye: Vec3) {
         let t0 = std::time::Instant::now();
+        let ai = (world.arena % ARENAS) as usize;
+        let st = &self.statics[ai];
         // opaque things front to back: floor and meadow first, the sky last, so
         // the GPU can skip the pixels the sky would only overdraw
-        draw_plane(vec3(0.0, 0.0, 0.0), vec2(ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0), Some(&self.ground), WHITE);
-        for m in self.statics.outer.iter().chain(&self.statics.solid).chain(&self.statics.brick) {
+        let floor = if ai == 2 { &self.ground_metal } else { &self.ground };
+        draw_plane(vec3(0.0, 0.0, 0.0), vec2(ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0), Some(floor), WHITE);
+        for m in st.outer.iter().chain(&st.solid).chain(&st.brick) {
             draw_mesh(m);
         }
-        PROF_CALLS.fetch_add((self.statics.outer.len() + self.statics.solid.len() + self.statics.brick.len()) as u64, std::sync::atomic::Ordering::Relaxed);
-        for m in self.statics.solid.iter().chain(&self.statics.outer).chain(&self.statics.brick) {
+        PROF_CALLS.fetch_add((st.outer.len() + st.solid.len() + st.brick.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+        for m in st.solid.iter().chain(&st.outer).chain(&st.brick) {
             PROF_VERTS.fetch_add(m.vertices.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
 
         let mut b = self.batch.borrow_mut();
-        if !self.same_layout(world) {
+        if !Self::same_layout(world, st) {
             // a custom layout (tests): draw obstacles the slow way
             for (i, o) in world.obstacles.iter().enumerate() {
                 self.draw_obstacle(&mut b, o, i);
             }
         }
-        self.draw_clouds(&mut b, time);
-        self.draw_grass(&mut b, time);
+        if ai != 2 {
+            self.draw_clouds(&mut b, time);
+        }
+        self.draw_grass(&mut b, time, ai);
+        self.draw_gates(&mut b, world, time);
         for p in &world.pickups {
             self.draw_pickup(&mut b, p, time);
+        }
+        if world.ctf.is_some() {
+            self.draw_ctf(&mut b, world, time);
         }
         for t in world.tanks.iter() {
             let k = index_in_team(world, t.id);
@@ -632,7 +733,7 @@ impl Scene {
         }
         b.flush();
         drop(b);
-        draw_mesh(&self.statics.sky);
+        draw_mesh(&st.sky);
 
         // translucent things last
         for p in &world.pickups {
@@ -668,18 +769,70 @@ impl Scene {
         }
     }
 
-    /// Stone cap and corner posts of the arena wall (the brick faces are textured quads).
-    fn wall_caps(&self, b: &mut Batch) {
+    /// A painted line along the edge of the arena: no fence, just a clear sign of where play stops.
+    fn boundary_line(&self, b: &mut Batch) {
         let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
-        let t = WALL_T;
-        let cap = Color::new(0.58, 0.56, 0.52, 1.0);
-        let sides = [(0.0, -hh - t / 2.0, hw * 2.0 + t * 2.0, true), (0.0, hh + t / 2.0, hw * 2.0 + t * 2.0, true), (-hw - t / 2.0, 0.0, hh * 2.0, false), (hw + t / 2.0, 0.0, hh * 2.0, false)];
-        for &(cx, cz, len, along_x) in sides.iter() {
-            let dims = if along_x { vec3(len, 0.07, t + 0.14) } else { vec3(t + 0.14, 0.07, len) };
-            b.box_faces(vec3(cx, WALL_H + 0.035, cz), dims, Quat::IDENTITY, cap, 0b000001 | 0b111100);
+        let col = Color::new(0.95, 0.93, 0.82, 1.0);
+        let t = 0.14;
+        b.box_q(vec3(0.0, 0.012, -hh + t / 2.0), vec3(hw * 2.0, 0.02, t), Quat::IDENTITY, col);
+        b.box_q(vec3(0.0, 0.012, hh - t / 2.0), vec3(hw * 2.0, 0.02, t), Quat::IDENTITY, col);
+        b.box_q(vec3(-hw + t / 2.0, 0.012, 0.0), vec3(t, 0.02, hh * 2.0), Quat::IDENTITY, col);
+        b.box_q(vec3(hw - t / 2.0, 0.012, 0.0), vec3(t, 0.02, hh * 2.0), Quat::IDENTITY, col);
+    }
+
+    /// A low solid kerb just outside the playfield. Tanks and bullets really do stop at
+    /// the edge, so the edge has to look like something (phones show a lot of floor
+    /// beyond it); shots that bounce here visibly hit a wall.
+    fn edge_curb(&self, b: &mut Batch, metal: bool) {
+        let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
+        let (t, h) = (0.45, 0.42);
+        let col = if metal { Color::new(0.30, 0.33, 0.38, 1.0) } else { Color::new(0.55, 0.52, 0.47, 1.0) };
+        b.box_q(vec3(0.0, h / 2.0, -hh - t / 2.0), vec3(hw * 2.0 + t * 2.0, h, t), Quat::IDENTITY, col);
+        b.box_q(vec3(0.0, h / 2.0, hh + t / 2.0), vec3(hw * 2.0 + t * 2.0, h, t), Quat::IDENTITY, col);
+        b.box_q(vec3(-hw - t / 2.0, h / 2.0, 0.0), vec3(t, h, hh * 2.0), Quat::IDENTITY, col);
+        b.box_q(vec3(hw + t / 2.0, h / 2.0, 0.0), vec3(t, h, hh * 2.0), Quat::IDENTITY, col);
+    }
+
+    /// Yellow and black hazard blocks all round the edge of the Facility floor.
+    fn hazard_border(&self, b: &mut Batch) {
+        let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
+        let t = 0.7;
+        let col = |i: i32| if i % 2 == 0 { Color::new(0.95, 0.78, 0.1, 1.0) } else { Color::new(0.12, 0.12, 0.13, 1.0) };
+        let nx = (hw * 2.0 / t).round() as i32;
+        let nz = (hh * 2.0 / t).round() as i32;
+        let (sx, sz) = (hw * 2.0 / nx as f32, hh * 2.0 / nz as f32);
+        for i in 0..nx {
+            let x = -hw + (i as f32 + 0.5) * sx;
+            b.box_q(vec3(x, 0.014, -hh + t / 2.0), vec3(sx, 0.03, t), Quat::IDENTITY, col(i));
+            b.box_q(vec3(x, 0.014, hh - t / 2.0), vec3(sx, 0.03, t), Quat::IDENTITY, col(i));
         }
-        for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-            b.box_q(vec3(sx * (hw + t / 2.0), WALL_H / 2.0 + 0.06, sz * (hh + t / 2.0)), vec3(t + 0.2, WALL_H + 0.12, t + 0.2), Quat::IDENTITY, cap);
+        for j in 1..nz - 1 {
+            let z = -hh + (j as f32 + 0.5) * sz;
+            b.box_q(vec3(-hw + t / 2.0, 0.014, z), vec3(t, 0.03, sz), Quat::IDENTITY, col(j));
+            b.box_q(vec3(hw - t / 2.0, 0.014, z), vec3(t, 0.03, sz), Quat::IDENTITY, col(j));
+        }
+    }
+
+    /// Machine gates: a barrel in the owner's colour that glows just before each shot.
+    fn draw_gates(&self, b: &mut Batch, world: &World, time: f32) {
+        for g in &world.gates {
+            let col = team_color(g.team, 0);
+            let c = w3(g.x, g.y, 0.0);
+            // collar and team cap on the housing
+            b.box_y(vec3(c.x, 0.7, c.z), vec3(0.62, 0.1, 0.62), 0.0, col);
+            let q = Quat::from_rotation_y(-g.angle);
+            let dir = vec3(g.angle.cos(), 0.0, g.angle.sin());
+            // twin barrels side by side, the shot leaves between them
+            let side = vec3(-dir.z, 0.0, dir.x) * 0.13;
+            for sgn in [-1.0f32, 1.0] {
+                b.box_q(vec3(c.x, 0.9, c.z) + dir * 0.55 + side * sgn, vec3(1.0, 0.16, 0.16), q, Color::new(0.22, 0.23, 0.25, 1.0));
+            }
+            b.box_q(vec3(c.x, 0.9, c.z) + dir * 0.15, vec3(0.45, 0.34, 0.5), q, col);
+            if g.charging() {
+                let k = 1.0 - g.timer / crate::sim::GATE_WARN;
+                let pulse = 0.12 + 0.2 * k + 0.03 * (time * 30.0).sin();
+                b.sphere_n(vec3(c.x, 0.9, c.z) + dir * 1.12, pulse, 1.0, Color::new(1.0, 0.55 + 0.4 * k, 0.2 + 0.6 * k, 1.0), 4, 7);
+            }
         }
     }
 
@@ -715,9 +868,9 @@ impl Scene {
     }
 
     /// Gradient sky dome with a warm glow around the sun.
-    fn sky_mesh(&self) -> Mesh {
+    fn sky_mesh(&self, metal: bool) -> Mesh {
         let sun = vec3(-0.35, 0.8, 0.5).normalize();
-        let zenith = Color::new(0.20, 0.42, 0.78, 1.0);
+        let (haze, zenith) = if metal { (Color::new(0.07, 0.09, 0.13, 1.0), Color::new(0.03, 0.04, 0.07, 1.0)) } else { (HAZE, Color::new(0.20, 0.42, 0.78, 1.0)) };
         let elev = [-0.35f32, 0.0, 0.06, 0.16, 0.32, 0.55, 0.85, 1.15, 1.45, FRAC_PI_2];
         let segs = 36usize;
         let r = 400.0;
@@ -727,8 +880,8 @@ impl Scene {
                 let a = TAU * j as f32 / segs as f32;
                 let dir = vec3(e.cos() * a.cos(), e.sin(), e.cos() * a.sin());
                 let up = e.sin().max(0.0).powf(0.6);
-                let mut c = mix(HAZE, zenith, up);
-                let glow = dir.dot(sun).max(0.0).powi(12) * 0.35;
+                let mut c = mix(haze, zenith, up);
+                let glow = dir.dot(sun).max(0.0).powi(12) * if metal { 0.0 } else { 0.35 };
                 c = Color::new((c.r + glow).min(1.0), (c.g + glow * 0.85).min(1.0), (c.b + glow * 0.5).min(1.0), 1.0);
                 v.push(Vertex::new2(dir * r, vec2(0., 0.), c));
             }
@@ -746,13 +899,13 @@ impl Scene {
 
     /// Endless-looking meadow around the arena: a repeated seamless texture
     /// that fades into the haze at the horizon.
-    fn outer_meshes(&self) -> Vec<Mesh> {
+    fn outer_meshes(&self, metal: bool) -> Vec<Mesh> {
         let (hw, hh) = (ARENA_W / UNIT / 2.0, ARENA_H / UNIT / 2.0);
         let n = (OUTER_HALF * 2.0 / OUTER_TILE) as i32;
         let fog = |x: f32, z: f32| {
             let d = x.hypot(z);
             let t = ((d - 26.0) / (OUTER_HALF - 26.0)).clamp(0.0, 1.0);
-            mix(WHITE, Color::new(0.74, 0.86, 0.92, 1.0), t * t)
+            mix(WHITE, if metal { Color::new(0.07, 0.09, 0.13, 1.0) } else { Color::new(0.74, 0.86, 0.92, 1.0) }, t * t)
         };
         let mut v = Vec::with_capacity((n * n * 4) as usize);
         for iz in 0..n {
@@ -776,7 +929,7 @@ impl Scene {
                 let (a, e) = (chunk * per, ((chunk + 1) * per).min(quads));
                 let verts = v[a * 4..e * 4].to_vec();
                 let ind: Vec<u16> = (0..(e - a) as u16).flat_map(|q| [q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3]).collect();
-                Mesh { vertices: verts, indices: ind, texture: Some(self.outer.clone()) }
+                Mesh { vertices: verts, indices: ind, texture: Some(if metal { self.outer_metal.clone() } else { self.outer.clone() }) }
             })
             .collect()
     }
@@ -851,9 +1004,9 @@ impl Scene {
     }
 
     /// Swaying tufts of grass scattered over the arena floor.
-    fn draw_grass(&self, b: &mut Batch, time: f32) {
+    fn draw_grass(&self, b: &mut Batch, time: f32, ai: usize) {
         let base = Color::new(0.10, 0.27, 0.07, 1.0);
-        for tf in &self.tufts {
+        for tf in &self.tufts[ai] {
             let p = w3(tf.x, tf.y, 0.0);
             let sway = (time * 1.6 + tf.x * 0.05 + tf.y * 0.03).sin() * 0.05;
             let tip = Color::new(0.42 * tf.tone, 0.64 * tf.tone, 0.20 * tf.tone, 1.0);
@@ -988,10 +1141,60 @@ impl Scene {
         }
     }
 
+    /// Bases, flags and mines for capture the flag.
+    fn draw_ctf(&self, b: &mut Batch, world: &World, time: f32) {
+        let Some(c) = world.ctf.as_ref() else { return };
+        let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        for (team, f) in c.flags.iter().enumerate() {
+            let col = team_color(team as u8, 0);
+            let dark = Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0);
+            // base pad with a bright ring
+            let hp = w3(f.home.0, f.home.1, 0.03);
+            b.disc(hp, 1.3, 0.04, flat, dark, col, 0.0, 24);
+            b.disc(hp + vec3(0.0, 0.02, 0.0), 1.0, 0.04, flat, Color::new(0.85, 0.85, 0.85, 1.0), Color::new(0.75, 0.75, 0.78, 1.0), 0.0, 20);
+            // the flag, standing behind its carrier when taken
+            let (mut fx, mut fy, mut tall) = (f.x, f.y, 1.9);
+            if let Some(t) = f.carrier.and_then(|id| world.tank(id)) {
+                fx -= t.angle.cos() * 14.0;
+                fy -= t.angle.sin() * 14.0;
+                tall = 2.1;
+            }
+            let base = w3(fx, fy, 0.0);
+            b.box_y(base + vec3(0.0, tall / 2.0, 0.0), vec3(0.07, tall, 0.07), 0.0, Color::new(0.8, 0.8, 0.82, 1.0));
+            b.sphere_n(base + vec3(0.0, tall + 0.04, 0.0), 0.07, 1.0, brass_c(), 4, 6);
+            for i in 0..5 {
+                let w = 0.24;
+                let wave = 0.09 * (time * 6.0 - i as f32 * 0.9).sin() * (i as f32 + 1.0) / 3.0;
+                let h = 0.72 - i as f32 * 0.07;
+                b.box_y(base + vec3(0.12 + i as f32 * w, tall - 0.4, wave), vec3(w, h, 0.03), 0.0, if i == 4 { Color::new(1.0, 1.0, 1.0, 1.0) } else { col });
+            }
+            // a dropped flag pulses so it is easy to spot and return
+            if f.carrier.is_none() && !f.at_home() {
+                let r = 0.5 + 0.15 * (time * 5.0).sin();
+                b.disc(w3(f.x, f.y, 0.05), r, 0.03, flat, Color::new(1.0, 0.9, 0.3, 1.0), Color::new(1.0, 0.6, 0.2, 1.0), 0.0, 14);
+            }
+        }
+        for m in &c.mines {
+            let col = team_color(m.team, 0);
+            let pos = w3(m.x, m.y, 0.07);
+            b.cyl(pos, 0.3, 0.14, Color::new(0.2, 0.2, 0.22, 1.0));
+            let on = m.armed() && (time * 4.0).sin() > 0.0;
+            b.sphere_n(pos + vec3(0.0, 0.14, 0.0), 0.1, 1.0, if on { Color::new(1.0, 0.15, 0.1, 1.0) } else { col }, 4, 6);
+        }
+    }
+
     fn draw_pickup(&self, b: &mut Batch, p: &Pickup, time: f32) {
         let (r, g, bl) = p.kind.rgb();
         let col = Color::new(r, g, bl, 1.0);
         let bob = 0.1 * (time * 3.0 + p.id as f32).sin();
+        if p.kind == PickupKind::Mystery {
+            // a spinning purple star of two cubes with a white core: "what is it?"
+            let c = w3(p.x, p.y, 0.55 + bob);
+            b.box_y(c, vec3(0.42, 0.42, 0.42), time * 1.4, col);
+            b.box_y(c, vec3(0.42, 0.42, 0.42), time * 1.4 + std::f32::consts::FRAC_PI_4, Color::new(0.55, 0.3, 0.85, 1.0));
+            b.sphere_n(c, 0.17, 1.0, Color::new(1.0, 1.0, 1.0, 1.0), 4, 6);
+            return;
+        }
         b.box_y(w3(p.x, p.y, 0.5 + bob), vec3(0.38, 0.38, 0.38), time * 1.6, col);
         b.box_y(w3(p.x, p.y, 0.5 + bob), vec3(0.22, 0.46, 0.22), time * 1.6 + 0.8, Color::new(1.0, 1.0, 1.0, 1.0));
     }
@@ -1386,8 +1589,9 @@ impl CamState {
         // Overview: tilted view that fits the whole arena for any aspect ratio.
         let fovy = 45f32.to_radians();
         let tan = (fovy / 2.0).tan();
-        let tilt = 58f32.to_radians();
-        let dist = ((ARENA_W / UNIT / 2.0 + 0.8) / (tan * aspect)).max((ARENA_H / UNIT / 2.0 + 2.4) / tan).max(12.0);
+        // the arena fills the whole screen edge to edge
+        let tilt = 66f32.to_radians();
+        let dist = ((ARENA_W / UNIT / 2.0 + 1.4) / (tan * aspect)).max((ARENA_H / UNIT / 2.0 + 0.2) / tan).max(12.0);
         Camera3D {
             position: vec3(0.0, tilt.sin() * dist, tilt.cos() * dist),
             target: vec3(0.0, 0.0, 0.3),

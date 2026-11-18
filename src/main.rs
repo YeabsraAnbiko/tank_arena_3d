@@ -1,4 +1,5 @@
 mod audio;
+mod ctf;
 mod gfx;
 mod net;
 mod settings;
@@ -80,6 +81,10 @@ struct App {
     notice: Option<(String, f32)>,
     roster: Vec<RosterEntry>,
     lobby_match_type: u8,
+    lobby_ctf: bool,
+    lobby_arena: u8,
+    /// keeps the item press alive long enough to survive a dropped packet
+    item_hold: f32,
     status: String,
     play_time: f32,
     targets: HashMap<u32, (f32, f32, f32, f32)>,
@@ -119,6 +124,7 @@ struct TouchCtl {
     look_moved: f32,
     boost_grace: f32,
     tap_pending: bool,
+    item_pressed: bool,
 }
 
 fn demo_world(seed: u64) -> World {
@@ -195,8 +201,29 @@ impl App {
         for i in 0..3 {
             specs.push(PlayerSpec { id: 1 + i, name: format!("Bot {}", i + 1), team: 1, ai: true, kind: ((pick / 7 + i * 2 + i / 2) % KINDS as u32) as u8 });
         }
-        self.begin_match(World::new_match(&specs, (get_time() * 1000.0) as u64 + 1), 0);
+        self.begin_match(World::build(&specs, (get_time() * 1000.0) as u64 + 1, false, self.settings.arena), 0);
         self.mode = Mode::Offline;
+    }
+
+    /// Solo capture-the-flag tournament: you plus bots on both sides.
+    fn start_ctf_practice(&mut self) {
+        let mt = self.settings.match_type.max(1) as u32;
+        let mut specs = vec![PlayerSpec { id: 0, name: self.settings.name.clone(), team: 0, ai: false, kind: self.settings.tank }];
+        let mut next = crate::ctf::BOT_ID_BASE;
+        for team in 0..2u8 {
+            let have = if team == 0 { 1 } else { 0 };
+            for k in have..mt {
+                specs.push(PlayerSpec { id: next, name: format!("Bot {}", k + 1), team, ai: true, kind: (next % KINDS as u32) as u8 });
+                next += 1;
+            }
+        }
+        self.mode = Mode::Offline;
+        let mut w = World::build(&specs, (get_time() * 1000.0) as u64 + 3, true, self.settings.arena);
+        // test hook: shorten the tournament for automated screenshots
+        if let (Ok(t), Some(c)) = (std::env::var("TA_CTF_TIME"), w.ctf.as_mut()) {
+            c.time_left = t.parse().unwrap_or(c.time_left);
+        }
+        self.begin_match(w, 0);
     }
 
     fn begin_match(&mut self, world: World, my_id: u32) {
@@ -220,6 +247,7 @@ impl App {
         match Host::new(PORT, &self.settings.name, self.settings.match_type) {
             Ok(mut h) => {
                 h.roster[0].kind = self.settings.tank;
+                h.arena = self.settings.arena;
                 self.mode = Mode::Host(h);
                 self.screen = Screen::HostLobby;
             }
@@ -245,8 +273,9 @@ impl App {
                 return;
             }
             h.in_game = true;
-            let specs = roster_to_specs(&h.roster);
-            let w = World::new_match(&specs, (get_time() * 1000.0) as u64 + 7);
+            let specs = h.match_specs();
+            let seed = (get_time() * 1000.0) as u64 + 7;
+            let w = World::build(&specs, seed, h.ctf, h.arena);
             self.begin_match(w, 0);
         }
     }
@@ -340,6 +369,9 @@ async fn main() {
         notice: None,
         roster: Vec::new(),
         lobby_match_type: 2,
+        lobby_ctf: false,
+        lobby_arena: 0,
+        item_hold: 0.0,
         status: String::new(),
         play_time: 0.0,
         targets: HashMap::new(),
@@ -470,8 +502,10 @@ fn client_lobby_poll(app: &mut App) -> bool {
     if let Mode::Client(c) = &mut app.mode {
         for m in c.poll(Control::default()) {
             match m {
-                ClientMsg::Lobby { match_type, roster } => {
+                ClientMsg::Lobby { match_type, ctf, arena, roster } => {
                     app.lobby_match_type = match_type;
+                    app.lobby_ctf = ctf;
+                    app.lobby_arena = arena;
                     app.roster = roster;
                 }
                 ClientMsg::Reject(r) => left = Some(r),
@@ -479,7 +513,7 @@ fn client_lobby_poll(app: &mut App) -> bool {
                     if s.starts_with("STATE:P") {
                         start = true;
                         let specs = roster_to_specs(&app.roster);
-                        let mut w = World::new_match(&specs, 0);
+                        let mut w = World::build(&specs, 0, app.lobby_ctf, app.lobby_arena);
                         w.apply_state(&s);
                         app.world = w;
                     }
@@ -552,8 +586,13 @@ fn run_menus(app: &mut App) {
             app.ui.text(&format!("Playing as {}", app.settings.name), cx, 205.0, 22.0, ACCENT, Align::Center);
             let (w, h) = (460.0, 58.0);
             let x = cx - w / 2.0;
-            if app.ui.button(x, 235.0, w, h, "PRACTICE VS BOTS", Style::Primary) {
+            let half0 = (w - 12.0) / 2.0;
+            if app.ui.button(x, 235.0, half0, h, "PRACTICE", Style::Primary) {
                 app.start_practice();
+            }
+            if app.ui.button(x + half0 + 12.0, 235.0, half0, h, "CTF VS BOTS", Style::Primary) {
+                app.start_ctf_practice();
+                return;
             }
             if app.ui.button(x, 300.0, w, h, "HOST LAN GAME", Style::Normal) {
                 app.start_host();
@@ -577,17 +616,28 @@ fn run_menus(app: &mut App) {
                 app.screen = Screen::HowTo;
                 return;
             }
-            if cfg!(not(target_os = "android")) && app.ui.button(x, 560.0, w, 50.0, "QUIT", Style::Danger) {
+            let arena_label = format!("ARENA: {}", arena_name(app.settings.arena));
+            if app.ui.button(x, 560.0, w, 50.0, &arena_label, Style::Normal) {
+                app.settings.arena = (app.settings.arena + 1) % ARENAS;
+                app.settings.save();
+            }
+            if cfg!(not(target_os = "android")) && app.ui.button(x, 622.0, w, 46.0, "QUIT", Style::Danger) {
                 app.quit = true;
             }
             if !app.touch_mode {
-                app.ui.text("1 PRACTICE  2 HOST  3 JOIN  G GARAGE  S SETTINGS  H HELP", cx, 660.0, 18.0, DIM, Align::Center);
+                app.ui.text("1 PRACTICE  2 HOST  3 JOIN  4 CTF  A ARENA  G GARAGE  S SETTINGS  H HELP", cx, 696.0, 18.0, DIM, Align::Center);
                 if is_key_pressed(KeyCode::Key1) || is_key_pressed(KeyCode::Enter) {
                     app.start_practice();
+                } else if is_key_pressed(KeyCode::Key4) {
+                    app.start_ctf_practice();
+                    return;
                 } else if is_key_pressed(KeyCode::Key2) {
                     app.start_host();
                 } else if is_key_pressed(KeyCode::Key3) {
                     app.start_join();
+                } else if is_key_pressed(KeyCode::A) {
+                    app.settings.arena = (app.settings.arena + 1) % ARENAS;
+                    app.settings.save();
                 } else if is_key_pressed(KeyCode::G) {
                     app.garage_sel = app.settings.tank;
                     app.screen = Screen::Garage;
@@ -693,7 +743,7 @@ fn run_menus(app: &mut App) {
         }
         Screen::HowTo => {
             // Paged so nothing can run off the panel. Text shrinks if a page is still too tall.
-            let pages: [(&str, Vec<(String, String)>); 4] = [
+            let pages: [(&str, Vec<(String, String)>); 5] = [
                 (
                     "CONTROLS",
                     vec![
@@ -728,6 +778,18 @@ fn run_menus(app: &mut App) {
                             (st.name.to_string(), format!("{} - armour {}, {} rounds.", st.blurb, st.hp, st.ammo))
                         })
                         .collect(),
+                ),
+                (
+                    "CAPTURE THE FLAG",
+                    vec![
+                        ("GOAL".into(), "Steal the enemy flag and carry it to your own base. You score only while your own flag is safe at home.".into()),
+                        ("FLAGS".into(), "Shoot the carrier and the flag drops. Touch your dropped flag to send it home, or it returns by itself after 12 seconds.".into()),
+                        ("RESPAWN".into(), "Destroyed tanks come back at their base after 4 seconds. Bots fill every empty slot.".into()),
+                        ("ITEMS".into(), "Purple boxes hold one secret item: a bomb mine, a shield or a spread shot. Use it with V or the ITEM button.".into()),
+                        ("GATES".into(), "Machine gates guard each base and fire single shots on a rhythm, straight along the lane. The barrel glows just before. Their shots never hurt their own team, and a shield blocks them.".into()),
+                        ("ARENAS".into(), "Pick the arena on the menu (A) or in the host lobby: Meadow, Foundry (slag pit) or Facility (steel bunker with a grated corridor). Gates shoot straight in the last two. No walls, only the edge line.".into()),
+                        ("SCORE".into(), "The score is hidden during the 4 minute tournament and revealed at the end.".into()),
+                    ],
                 ),
             ];
             let np = pages.len();
@@ -910,7 +972,7 @@ fn run_menus(app: &mut App) {
                         }
                         ClientMsg::Welcome(_) => welcomed = true,
                         ClientMsg::Reject(r) => rejected = Some(r),
-                        ClientMsg::Lobby { match_type, roster } => lobby = Some((match_type, roster)),
+                        ClientMsg::Lobby { match_type, roster, .. } => lobby = Some((match_type, roster)),
                         ClientMsg::State(_) => {}
                     }
                 }
@@ -962,31 +1024,49 @@ fn run_menus(app: &mut App) {
             }
             let ip = local_ip().unwrap_or_else(|| "?".into());
             let (roster, mt, can_start) = match &app.mode {
-                Mode::Host(h) => (h.roster.clone(), h.match_type, h.can_start()),
+                Mode::Host(h) => (h.full_roster(), h.match_type, h.can_start()),
                 _ => (Vec::new(), 2, false),
             };
+            let ctf_now = matches!(&app.mode, Mode::Host(h) if h.ctf);
             app.ui.text(&format!("Your IP: {}", ip), cx, 128.0, 24.0, DIM, Align::Center);
-            draw_roster(&app.ui, &roster, mt, 0);
+            draw_roster(&app.ui, &roster, mt, 0, ctf_now);
             if let Some(t) = team_tap(&app.ui, &roster, mt, 0) {
                 if let Mode::Host(h) = &mut app.mode {
                     h.swap_team(0, t);
                 }
             }
             let mode_label = format!("MODE: {}v{}", mt, mt);
-            if app.ui.button(cx - 360.0, 585.0, 230.0, 60.0, &mode_label, Style::Normal) {
+            let ctf = matches!(&app.mode, Mode::Host(h) if h.ctf);
+            let bw = 172.0;
+            let bx = cx - (bw * 4.0 + 36.0) / 2.0;
+            if app.ui.button(bx, 585.0, bw, 60.0, &mode_label, Style::Normal) {
                 if let Mode::Host(h) = &mut app.mode {
                     h.cycle_match_type();
                     app.settings.match_type = h.match_type;
                     app.settings.save();
                 }
             }
+            let arena_now = if let Mode::Host(h) = &app.mode { h.arena } else { 0 };
+            if app.ui.button(VW - 330.0, 100.0, 300.0, 46.0, &format!("ARENA: {}", arena_name(arena_now)), Style::Normal) {
+                if let Mode::Host(h) = &mut app.mode {
+                    h.cycle_arena();
+                    app.settings.arena = h.arena;
+                    app.settings.save();
+                }
+            }
+            let game_label = if ctf { "GAME: CTF" } else { "GAME: BATTLE" };
+            if app.ui.button(bx + bw + 12.0, 585.0, bw, 60.0, game_label, if ctf { Style::Primary } else { Style::Normal }) {
+                if let Mode::Host(h) = &mut app.mode {
+                    h.toggle_ctf();
+                }
+            }
             let st = if can_start { Style::Primary } else { Style::Disabled };
-            if (app.ui.button(cx - 115.0, 585.0, 230.0, 60.0, "START", st) || is_key_pressed(KeyCode::Enter)) && can_start {
+            if (app.ui.button(bx + (bw + 12.0) * 2.0, 585.0, bw, 60.0, "START", st) || is_key_pressed(KeyCode::Enter)) && can_start {
                 app.screen = Screen::Menu;
                 app.host_begin();
                 return;
             }
-            if app.ui.button(cx + 130.0, 585.0, 230.0, 60.0, "BACK", Style::Danger) {
+            if app.ui.button(bx + (bw + 12.0) * 3.0, 585.0, bw, 60.0, "BACK", Style::Danger) {
                 app.leave_to_menu();
                 return;
             }
@@ -1007,13 +1087,13 @@ fn run_menus(app: &mut App) {
             if client_lobby_poll(app) {
                 return;
             }
-            draw_roster(&app.ui, &app.roster, app.lobby_match_type, app.my_id);
+            draw_roster(&app.ui, &app.roster, app.lobby_match_type, app.my_id, app.lobby_ctf);
             if let Some(t) = team_tap(&app.ui, &app.roster, app.lobby_match_type, app.my_id) {
                 if let Mode::Client(c) = &mut app.mode {
                     c.request_team(t);
                 }
                 let me = app.my_id;
-                let room = app.roster.iter().filter(|e| e.team == t).count() < app.lobby_match_type as usize;
+                let room = app.roster.iter().filter(|e| e.team == t).count() < app.lobby_match_type as usize && !app.lobby_ctf;
                 if room {
                     if let Some(e) = app.roster.iter_mut().find(|e| e.id == me) {
                         e.team = t; // shows instantly; the host's roster confirms it
@@ -1036,8 +1116,10 @@ fn run_menus(app: &mut App) {
     }
 }
 
-fn draw_roster(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) {
-    ui.text(&format!("{}v{} match   {}/{} players", mt, mt, roster.len(), capacity(mt)), VW / 2.0, 160.0, 24.0, TEXT, Align::Center);
+fn draw_roster(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32, ctf: bool) {
+    let humans = roster.iter().filter(|e| e.id < crate::ctf::BOT_ID_BASE).count();
+    let kind = if ctf { "CTF tournament" } else { "match" };
+    ui.text(&format!("{}v{} {}   {}/{} players", mt, mt, kind, humans, capacity(mt)), VW / 2.0, 160.0, 24.0, TEXT, Align::Center);
     let my_team = roster.iter().find(|e| e.id == me).map(|e| e.team);
     for team in 0..2u8 {
         let x = 200.0 + team as f32 * 460.0;
@@ -1050,12 +1132,12 @@ fn draw_roster(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) {
         }
         ui.text(name, x + 210.0, 220.0, 28.0, col, Align::Center);
         for (i, e) in roster.iter().filter(|e| e.team == team).enumerate() {
-            let you = if e.id == me { " (you)" } else { "" };
+            let you = if e.id == me { " (you)" } else if e.id >= crate::ctf::BOT_ID_BASE { " (bot)" } else { "" };
             ui.text_fit(&format!("{}{} [{}]", e.name, you, stats(e.kind).name), x + 30.0, 275.0 + i as f32 * 46.0, 24.0, TEXT, Align::Left, 370.0);
         }
         let foot = if my_team == Some(team) {
             "YOUR TEAM"
-        } else if count >= mt as usize {
+        } else if !ctf && count >= mt as usize {
             "FULL"
         } else {
             "TAP HERE TO JOIN"
@@ -1085,6 +1167,7 @@ fn team_tap(ui: &Ui, roster: &[RosterEntry], mt: u8, me: u32) -> Option<u8> {
 const FIRE_BTN: (f32, f32, f32) = (1130.0, 560.0, 90.0);
 const BOOST_BTN: (f32, f32, f32) = (975.0, 625.0, 58.0);
 const RELOAD_BTN: (f32, f32, f32) = (1190.0, 410.0, 46.0);
+const ITEM_BTN: (f32, f32, f32) = (1050.0, 420.0, 50.0);
 const STICK_R: f32 = 95.0;
 // "aim + drive button" touch layout
 const DRIVE_BTN: (f32, f32, f32) = (190.0, 540.0, 105.0);
@@ -1257,6 +1340,10 @@ fn touch_input(app: &mut App) -> (f32, f32, bool, bool, bool) {
             boost = true;
         } else if inside(RELOAD_BTN) {
             reload = true;
+        } else if app.world.ctf.is_some() && inside(ITEM_BTN) {
+            if t.phase == TouchPhase::Started {
+                app.touch.item_pressed = true;
+            }
         } else if aim_drive && inside(DRIVE_BTN) {
             drive_btn = true;
         } else if aim_drive && inside(REV_BTN) {
@@ -1317,6 +1404,14 @@ fn draw_touch_controls(app: &App) {
         draw_circle(x, y, b.2 * u, Color::new(col.r, col.g, col.b, if on { 0.55 } else { 0.22 }));
         draw_circle_lines(x, y, b.2 * u, 3.0 * u, Color::new(col.r, col.g, col.b, 0.9));
         app.ui.text(label, b.0, b.1, if b.2 > 80.0 { 30.0 } else { 24.0 }, TEXT, Align::Center);
+    }
+    if let Some(me) = app.world.tank(app.my_id).filter(|_| app.world.ctf.is_some()) {
+        let col = if me.item == 0 { Color::new(0.6, 0.6, 0.65, 1.0) } else { let c = crate::ctf::item_rgb(me.item); Color::new(c.0, c.1, c.2, 1.0) };
+        let (x, y) = at(ITEM_BTN.0, ITEM_BTN.1);
+        draw_circle(x, y, ITEM_BTN.2 * u, Color::new(col.r, col.g, col.b, if me.item == 0 { 0.12 } else { 0.4 }));
+        draw_circle_lines(x, y, ITEM_BTN.2 * u, 3.0 * u, Color::new(col.r, col.g, col.b, 0.9));
+        let label = if me.item == 0 { "ITEM" } else { crate::ctf::item_label(me.item) };
+        app.ui.text(label, ITEM_BTN.0, ITEM_BTN.1, 20.0, TEXT, Align::Center);
     }
     if app.settings.aim_drive {
         let (d, r) = app.touch.drive_flags;
@@ -1405,20 +1500,33 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
     // --- input ---
     let quit_r = app.ui.r(16.0, 14.0, 130.0, 50.0);
     let cam_r = app.ui.r(VW - 276.0, 14.0, 260.0, 50.0);
+    let ctf = app.world.ctf.is_some();
+    let item_btn_shown = ctf && !(drive && app.touch_mode);
+    let item_r = app.ui.r(VW - 216.0, 72.0, 200.0, 50.0);
+    let item_click = item_btn_shown && app.ui.click.map_or(false, |c| item_r.contains(c));
     if let Some(c) = app.ui.click {
-        hold.active = !quit_r.contains(c) && !cam_r.contains(c) && !over && !app.paused;
+        hold.active = !quit_r.contains(c) && !cam_r.contains(c) && !(item_btn_shown && item_r.contains(c)) && !over && !app.paused;
     }
     if !app.ui.down {
         hold.active = false;
     }
     let held = !app.paused && ((app.ui.down && hold.active) || is_key_down(KeyCode::Space) || forced);
-    let ctrl = if app.paused || over {
+    let mut ctrl = if app.paused || over {
         Control { drive, aim: app.aim, ..Default::default() }
     } else if drive {
         gather_drive(app, dt, frame)
     } else {
         Control::classic(held)
     };
+    // use the held mystery item: V, the ITEM button, or the touch ITEM circle
+    if ctf && !app.paused && !over {
+        if is_key_pressed(KeyCode::V) || item_click || std::mem::take(&mut app.touch.item_pressed) {
+            app.item_hold = 0.25;
+        } else {
+            app.item_hold = (app.item_hold - dt).max(0.0);
+        }
+        ctrl.use_item = app.item_hold > 0.0;
+    }
 
     // --- simulation per mode ---
     let mut back_to_lobby_client = false;
@@ -1445,6 +1553,9 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
                 app.world.kill_player(id);
             }
             for t in app.world.tanks.iter_mut() {
+                if t.ai.is_some() {
+                    continue; // bots steer themselves
+                }
                 let c = if t.id == 0 { ctrl } else { h.input(t.id) };
                 t.ctrl = c;
                 t.held = c.held;
@@ -1487,8 +1598,10 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
                             }
                         }
                     }
-                    ClientMsg::Lobby { match_type, roster } => {
+                    ClientMsg::Lobby { match_type, ctf, arena, roster } => {
                         app.lobby_match_type = match_type;
+                        app.lobby_ctf = ctf;
+                        app.lobby_arena = arena;
                         app.roster = roster;
                         back_to_lobby_client = true;
                     }
@@ -1525,7 +1638,7 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
     let me = app.world.tank(my_id).filter(|t| t.alive);
     let me_alive = me.is_some();
     // where the next shot will go (drive view only)
-    let aim_line = if drive && !over { me.map(|t| app.world.trace_shot(t.x, t.y, t.turret, t.team)) } else { None };
+    let aim_line = if drive && !over { me.map(|t| app.world.trace_shot(t.x, t.y, if app.cam.chase { app.aim } else { t.turret }, t.team)) } else { None };
     if drive {
         app.cam.yaw = app.aim;
     }
@@ -1603,7 +1716,8 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
 
     // --- game over ---
     let mut next_action = 0; // 1 = rematch/play again, 2 = menu
-    if over {
+    let ctf_end = over && app.world.ctf.is_some();
+    if over && !ctf_end {
         app.ui.panel(380.0, 190.0, 520.0, 300.0);
         let my_team = app.world.tank(my_id).map(|t| t.team);
         let (msg, col) = match (app.world.winner, my_team) {
@@ -1632,8 +1746,11 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
             }
         }
     }
-    if over && app.ui.button(420.0, 420.0, 440.0, 50.0, "MAIN MENU", Style::Normal) {
+    if over && !ctf_end && app.ui.button(420.0, 420.0, 440.0, 50.0, "MAIN MENU", Style::Normal) {
         next_action = 2;
+    }
+    if ctf_end {
+        next_action = draw_ctf_end(app, my_id);
     }
 
     // --- transitions ---
@@ -1659,7 +1776,13 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
     }
     if next_action == 1 {
         match &mut app.mode {
-            Mode::Offline => app.start_practice(),
+            Mode::Offline => {
+                if app.world.ctf.is_some() {
+                    app.start_ctf_practice();
+                } else {
+                    app.start_practice();
+                }
+            }
             Mode::Host(h) => {
                 h.return_to_lobby();
                 app.screen = Screen::HostLobby;
@@ -1670,6 +1793,80 @@ fn run_play(app: &mut App, dt: f32, hold: &mut HoldTracker, forced: bool, frame:
     }
 }
 
+/// The big reveal at the end of a capture-the-flag tournament: final score,
+/// winner and everybody's numbers. Returns 1 for rematch, 2 for menu, else 0.
+fn draw_ctf_end(app: &mut App, my_id: u32) -> i32 {
+    let mut action = 0;
+    let Some(c) = app.world.ctf.clone() else { return 0 };
+    app.ui.panel(170.0, 40.0, 940.0, 640.0);
+    let my_team = app.world.tank(my_id).map(|t| t.team);
+    let (msg, col) = match (app.world.winner, my_team) {
+        (None, _) => ("DRAW".to_string(), ACCENT),
+        (Some(w), Some(mt)) if w == mt => ("VICTORY!".to_string(), Color::new(0.4, 1.0, 0.5, 1.0)),
+        (Some(w), None) => (format!("{} WINS", if w == 0 { "BLUE" } else { "RED" }), ACCENT),
+        (Some(_), _) => ("DEFEAT".to_string(), TEAM_RED),
+    };
+    app.ui.text(&msg, VW / 2.0, 100.0, 60.0, col, Align::Center);
+    app.ui.text("FINAL SCORE", VW / 2.0, 150.0, 18.0, DIM, Align::Center);
+    app.ui.text(&format!("{}", c.scores[0]), VW / 2.0 - 90.0, 200.0, 60.0, TEAM_BLUE, Align::Center);
+    app.ui.text("-", VW / 2.0, 200.0, 48.0, TEXT, Align::Center);
+    app.ui.text(&format!("{}", c.scores[1]), VW / 2.0 + 90.0, 200.0, 60.0, TEAM_RED, Align::Center);
+    if app.world.winner.is_some() && c.scores[0] == c.scores[1] {
+        app.ui.text("won on kills", VW / 2.0, 240.0, 18.0, DIM, Align::Center);
+    }
+
+    // MVP: most captures, then kills and returns
+    let points = |id: u32| {
+        let s = c.stat(id);
+        s.caps * 5 + s.kills + s.returns * 2
+    };
+    let mvp = app.world.tanks.iter().map(|t| t.id).max_by_key(|&id| (points(id), std::cmp::Reverse(id)));
+    let cols = [(780.0, "KILLS"), (870.0, "DEATHS"), (960.0, "FLAGS"), (1050.0, "SAVES")];
+    let mut y = 270.0;
+    for team in 0..2u8 {
+        let (name, tc) = if team == 0 { ("BLUE TEAM", TEAM_BLUE) } else { ("RED TEAM", TEAM_RED) };
+        app.ui.text(name, 210.0, y, 22.0, tc, Align::Left);
+        if team == 0 {
+            for (x, h) in cols {
+                app.ui.text(h, x, y, 15.0, DIM, Align::Right);
+            }
+        }
+        y += 28.0;
+        let mut members: Vec<&Tank> = app.world.tanks.iter().filter(|t| t.team == team).collect();
+        members.sort_by_key(|t| std::cmp::Reverse(points(t.id)));
+        for t in members {
+            let st = c.stat(t.id);
+            let you = if t.id == my_id { " (you)" } else { "" };
+            let tag = if Some(t.id) == mvp && points(t.id) > 0 { "  MVP" } else { "" };
+            let rc = if Some(t.id) == mvp && points(t.id) > 0 { ACCENT } else { TEXT };
+            app.ui.text_fit(&format!("{}{}{}", t.name, you, tag), 230.0, y, 20.0, rc, Align::Left, 440.0);
+            for (x, v) in [(780.0, st.kills), (870.0, st.deaths), (960.0, st.caps), (1050.0, st.returns)] {
+                app.ui.text(&v.to_string(), x, y, 20.0, rc, Align::Right);
+            }
+            y += 26.0;
+        }
+        y += 12.0;
+    }
+    let by = 612.0;
+    match &app.mode {
+        Mode::Client(_) => app.ui.text("Waiting for host rematch...", 440.0, by + 27.0, 20.0, ACCENT, Align::Center),
+        Mode::Host(_) => {
+            if app.ui.button(210.0, by, 460.0, 54.0, "REMATCH (LOBBY)", Style::Primary) {
+                action = 1;
+            }
+        }
+        Mode::Offline => {
+            if app.ui.button(210.0, by, 460.0, 54.0, "PLAY AGAIN", Style::Primary) {
+                action = 1;
+            }
+        }
+    }
+    if app.ui.button(700.0, by, 370.0, 54.0, "MAIN MENU", Style::Normal) {
+        action = 2;
+    }
+    action
+}
+
 fn draw_hud(app: &mut App, me_alive: bool) {
     let w = &app.world;
     let ui = &app.ui;
@@ -1677,9 +1874,30 @@ fn draw_hud(app: &mut App, me_alive: bool) {
     // team status, top centre
     let alive = |team: u8| w.tanks.iter().filter(|t| t.team == team && t.alive).count();
     let total = |team: u8| w.tanks.iter().filter(|t| t.team == team).count();
-    ui.fill(VW / 2.0 - 170.0, 14.0, 340.0, 46.0, Color::new(0.0, 0.0, 0.0, 0.45));
-    ui.text(&format!("BLUE {}/{}", alive(0), total(0)), VW / 2.0 - 160.0, 37.0, 24.0, TEAM_BLUE, Align::Left);
-    ui.text(&format!("{}/{} RED", alive(1), total(1)), VW / 2.0 + 160.0, 37.0, 24.0, TEAM_RED, Align::Right);
+    if let Some(c) = w.ctf.as_ref() {
+        // tournament clock and flag status; the score stays secret until the end
+        let secs = c.time_left.ceil() as i32;
+        ui.fill(VW / 2.0 - 230.0, 14.0, 460.0, 74.0, Color::new(0.0, 0.0, 0.0, 0.5));
+        let low = secs <= 30;
+        ui.text(&format!("{}:{:02}", secs / 60, secs % 60), VW / 2.0, 40.0, 36.0, if low { Color::new(1.0, 0.45, 0.35, 1.0) } else { TEXT }, Align::Center);
+        let state = |team: usize| {
+            let f = &c.flags[team];
+            if f.carrier.is_some() {
+                "TAKEN"
+            } else if f.at_home() {
+                "SAFE"
+            } else {
+                "DROPPED"
+            }
+        };
+        ui.text(&format!("BLUE FLAG {}", state(0)), VW / 2.0 - 220.0, 72.0, 17.0, TEAM_BLUE, Align::Left);
+        ui.text(&format!("RED FLAG {}", state(1)), VW / 2.0 + 220.0, 72.0, 17.0, TEAM_RED, Align::Right);
+        ui.text("SCORES REVEALED AT THE END", VW / 2.0, 100.0, 15.0, DIM, Align::Center);
+    } else {
+        ui.fill(VW / 2.0 - 170.0, 14.0, 340.0, 46.0, Color::new(0.0, 0.0, 0.0, 0.45));
+        ui.text(&format!("BLUE {}/{}", alive(0), total(0)), VW / 2.0 - 160.0, 37.0, 24.0, TEAM_BLUE, Align::Left);
+        ui.text(&format!("{}/{} RED", alive(1), total(1)), VW / 2.0 + 160.0, 37.0, 24.0, TEAM_RED, Align::Right);
+    }
 
     if let Some(t) = w.tank(app.my_id) {
         if t.alive {
@@ -1719,6 +1937,18 @@ fn draw_hud(app: &mut App, me_alive: bool) {
             if t.shield_t > 0.0 {
                 buffs.push((format!("SHIELD {:.0}", t.shield_t.ceil()), PickupKind::Shield));
             }
+            if w.ctf.is_some() {
+                let (label, col) = if t.item == 0 {
+                    ("ITEM: NONE".to_string(), DIM)
+                } else {
+                    let c = crate::ctf::item_rgb(t.item);
+                    (format!("ITEM: {}{}", crate::ctf::item_label(t.item), if app.touch_mode { "" } else { "  [V]" }), Color::new(c.0, c.1, c.2, 1.0))
+                };
+                ui.text(&label, 460.0, py + 20.0 + buffs.len() as f32 * 26.0, 20.0, col, Align::Left);
+                if t.spread_t > 0.0 {
+                    ui.text(&format!("SPREAD {:.0}", t.spread_t.ceil()), 460.0, py + 20.0 + (buffs.len() as f32 + 1.0) * 26.0, 20.0, Color::new(0.95, 0.85, 0.3, 1.0), Align::Left);
+                }
+            }
             for (i, (label, kind)) in buffs.iter().enumerate() {
                 let (r, g, b) = kind.rgb();
                 ui.text(label, 460.0, py + 20.0 + i as f32 * 26.0, 20.0, Color::new(r, g, b, 1.0), Align::Left);
@@ -1726,8 +1956,42 @@ fn draw_hud(app: &mut App, me_alive: bool) {
         }
     }
     if !me_alive && w.phase == Phase::Playing && w.tank(app.my_id).is_some() {
-        ui.fill(VW / 2.0 - 300.0, 90.0, 600.0, 56.0, Color::new(0.5, 0.1, 0.1, 0.8));
-        ui.text("ELIMINATED - spectating", VW / 2.0, 118.0, 28.0, TEXT, Align::Center);
+        ui.fill(VW / 2.0 - 300.0, 120.0, 600.0, 56.0, Color::new(0.5, 0.1, 0.1, 0.8));
+        if w.ctf.is_some() {
+            let r = w.tank(app.my_id).map(|t| t.respawn_t).unwrap_or(0.0).ceil().max(1.0);
+            ui.text(&format!("DESTROYED - back in {}", r as i32), VW / 2.0, 148.0, 28.0, TEXT, Align::Center);
+        } else {
+            ui.text("ELIMINATED - spectating", VW / 2.0, 148.0, 28.0, TEXT, Align::Center);
+        }
+    }
+    if let (Some(c), true) = (w.ctf.as_ref(), me_alive) {
+        if let Some(me) = w.tank(app.my_id) {
+            let mine = me.team as usize;
+            let msg = if c.flags[1 - mine].carrier == Some(me.id) {
+                if c.flags[mine].at_home() { Some(("YOU HAVE THE FLAG - GET HOME!", Color::new(1.0, 0.9, 0.3, 1.0))) } else { Some(("YOUR FLAG IS TAKEN - GET IT BACK FIRST!", Color::new(1.0, 0.55, 0.3, 1.0))) }
+            } else if c.flags[mine].carrier.is_some() {
+                Some(("ENEMY HAS YOUR FLAG - HUNT THE CARRIER!", Color::new(1.0, 0.45, 0.4, 1.0)))
+            } else if !c.flags[mine].at_home() {
+                Some(("YOUR FLAG IS DOWN - TOUCH IT TO RETURN", Color::new(1.0, 0.8, 0.4, 1.0)))
+            } else {
+                None
+            };
+            if let Some((m, col)) = msg {
+                ui.fill(VW / 2.0 - 340.0, 124.0, 680.0, 40.0, Color::new(0.0, 0.0, 0.0, 0.55));
+                ui.text_fit(m, VW / 2.0, 144.0, 22.0, col, Align::Center, 660.0);
+            }
+        }
+    }
+    if w.ctf.is_some() && !(drive && app.touch_mode) && me_alive {
+        // desktop / map view: a clickable ITEM button
+        let held = w.tank(app.my_id).map(|t| t.item).unwrap_or(0);
+        let label = if held == 0 { "NO ITEM".to_string() } else { format!("USE {} [V]", crate::ctf::item_label(held)) };
+        ui.fill(VW - 216.0, 72.0, 200.0, 50.0, Color::new(0.0, 0.0, 0.0, if held == 0 { 0.35 } else { 0.6 }));
+        let c = crate::ctf::item_rgb(held);
+        ui.text_fit(&label, VW - 116.0, 98.0, 20.0, if held == 0 { DIM } else { Color::new(c.0, c.1, c.2, 1.0) }, Align::Center, 190.0);
+    }
+    if app.play_time < 10.0 && me_alive && !app.paused && w.ctf.is_some() {
+        ui.text_fit("GRAB THE ENEMY FLAG AND BRING IT HOME   V = USE ITEM", VW / 2.0, 190.0, 24.0, Color::new(1.0, 1.0, 1.0, (10.0 - app.play_time).min(1.0)), Align::Center, 1200.0);
     }
     if app.play_time < 8.0 && me_alive && !app.paused {
         let hint = match (drive, app.touch_mode) {
@@ -1737,7 +2001,7 @@ fn draw_hud(app: &mut App, me_alive: bool) {
             (true, true) if app.settings.aim_stick => "LEFT STICK DRIVE   RIGHT STICK AIM",
             (true, true) => "LEFT STICK DRIVE   DRAG RIGHT TO AIM",
         };
-        ui.text_fit(hint, VW / 2.0, if drive && app.touch_mode { 250.0 } else { 120.0 }, 28.0, Color::new(1.0, 1.0, 1.0, (8.0 - app.play_time).min(1.0)), Align::Center, 1200.0);
+        ui.text_fit(hint, VW / 2.0, if drive && app.touch_mode { 250.0 } else if w.ctf.is_some() { 150.0 } else { 120.0 }, 28.0, Color::new(1.0, 1.0, 1.0, (8.0 - app.play_time).min(1.0)), Align::Center, 1200.0);
     }
 }
 
